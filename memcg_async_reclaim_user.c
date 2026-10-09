@@ -440,7 +440,8 @@ static bool memcg_on_path(const char *path)
  *
  * /tmp is tmpfs on many systems, so fall back to the current directory. That
  * fallback needs the same check: both directories are tmpfs more often than
- * not.
+ * not. Writability is checked too: a read-only mount cannot host the files
+ * at all, and EROFS applies to root as well.
  */
 static const char *workload_files_dir(void)
 {
@@ -450,7 +451,7 @@ static const char *workload_files_dir(void)
 
 	for (i = 0; i < 2; i++)
 		if (!statfs(dirs[i], &st) && st.f_type != TMPFS_MAGIC &&
-		    st.f_type != RAMFS_MAGIC)
+		    st.f_type != RAMFS_MAGIC && !access(dirs[i], W_OK))
 			return dirs[i];
 
 	return NULL;
@@ -800,8 +801,8 @@ static int do_bench(struct options *o)
 	dir = workload_files_dir();
 	if (!dir) {
 		fprintf(stderr, "ERROR: neither /tmp nor the working directory is on a\n"
-			"       regular filesystem; the workload needs one because\n"
-			"       tmpfs pages are not reclaimable without swap.\n");
+			"       writable regular filesystem; the workload needs one\n"
+			"       because tmpfs pages are not reclaimable without swap.\n");
 		return 1;
 	}
 
