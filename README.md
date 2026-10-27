@@ -1,15 +1,18 @@
 # memcg-async-reclaim
 
-BPF-driven asynchronous proactive memory cgroup reclaim: a BPF program
-watches the workingset refaults (file and anon) of a *monitor* cgroup and,
-when they grow past a threshold, reclaims memory from a *target* cgroup in
-bounded batches from `bpf_wq` work callbacks, through the
-`bpf_proactive_reclaim()` kfunc. The monitored workload never blocks on the
-reclaim.
+BPF-driven memory cgroup reclaim tooling. In its `bench` and `watch` modes a
+BPF program watches the workingset refaults (file and anon) of a *monitor*
+cgroup and, when they grow past a threshold, reclaims memory from a *target*
+cgroup in bounded batches from `bpf_wq` work callbacks, through the
+`bpf_proactive_reclaim()` kfunc; the monitored workload never blocks on the
+reclaim. Its `lowmin` mode instead uses the `bpf_memcg_ops` `memory.low` /
+`memory.min` policy hooks to keep a chosen cgroup's cache hot while the kernel
+reclaims a pressured sibling.
 
-This is the out-of-tree version of a sample submitted to the kernel's
-`samples/bpf` directory as ["samples/bpf: Add memcg async reclaim
-example"](https://sashiko.dev/#/message/de7adb6bafa3b808e29c0630f7ed9a2003e5e447.1790222105.git.zhuhui%40kylinos.cn).
+`bench`/`watch` are the out-of-tree version of a sample submitted to the
+kernel's `samples/bpf` directory as ["samples/bpf: Add memcg async reclaim
+example"](https://sashiko.dev/#/message/de7adb6bafa3b808e29c0630f7ed9a2003e5e447.1790222105.git.zhuhui%40kylinos.cn);
+`lowmin` is added here to exercise the memcg_ext protection hooks.
 
 ## Modes
 
@@ -18,6 +21,21 @@ page-cache workload in both and reports the effect of the asynchronous
 reclaim on the pressured one. By default the same workload first runs
 without the BPF program to produce a baseline. Self-contained: creates and
 removes its own cgroups and workload files.
+
+**lowmin** - like bench, but protects a cgroup with the `memory.low` /
+`memory.min` BPF policy hooks (`bpf_memcg_ops`' `low_policy`/`min_policy`)
+instead of refault-driven reclaim. It creates a parent with `memory.max` and
+two children, `prot` and `victim`, runs the page-cache workload in both, and
+attaches the policy to `prot`. The parent's limit forces kernel reclaim, which
+walks both children; the hook asserts that `prot` is below its threshold, so
+the kernel skips it and takes the memory from `victim` instead - `prot` keeps
+its cache and finishes faster. `--level` picks `low` (soft), `min` (hard) or
+`both`. Two things to know: the hook only fires for the reclaim *target's
+descendants*, never the target itself, so the protected cgroup has to be a
+child of the reclaimed parent; and `prot` carries no real `memory.low`/`min`,
+so the protection is purely the BPF policy's (a real threshold would make the
+kernel decide before ever asking BPF). Only `low_policy`/`min_policy` are
+used - this mode does not touch `high_policy`.
 
 **watch** - watches two existing cgroups and keeps reclaiming for as long as
 the program runs, so it can serve as a simple proactive-reclaim daemon.
@@ -30,6 +48,8 @@ Kernel:
 
 - the `bpf_proactive_reclaim()` kfunc, restricted to `BPF_PROG_TYPE_SYSCALL`
   (not yet in mainline; build a kernel with the patch series applied)
+- for `lowmin`, the `bpf_memcg_ops` struct_ops with `low_policy`/`min_policy`
+  (the memcg_ext protection hooks; shipped by the same patched kernel)
 - `CONFIG_MEMCG`, `CONFIG_BPF_SYSCALL`, `CONFIG_DEBUG_INFO_BTF`
   (`/sys/kernel/btf/vmlinux`), cgroup v2
 - swap only for swappiness `201` (anon-only) or anon-heavy watch workloads
@@ -38,9 +58,9 @@ Build:
 
 - clang (BPF target), bpftool, libbpf development headers and library,
   gcc, make
-- if the distro libbpf is too old for `bpf_wq` skeletons, point
-  `LIBBPF_CFLAGS`/`LIBBPF_LIBS` at a source build, e.g. the kernel's
-  `tools/lib/bpf`
+- if the distro libbpf is too old for `bpf_wq` skeletons or for `lowmin`'s
+  struct_ops cgroup attach, point `LIBBPF_CFLAGS`/`LIBBPF_LIBS` at a source
+  build, e.g. the kernel's `tools/lib/bpf`
 
 ## Build
 
@@ -67,10 +87,25 @@ make LIBBPF_CFLAGS="-I$KDIR/tools/lib/bpf" \
      LIBBPF_LIBS="-L$KDIR/tools/lib/bpf -lbpf -lelf -lz"
 ```
 
+Linking is dynamic by default. If the binary is built against a newer libbpf
+than the runtime finds - it then fails with e.g. ``version `LIBBPF_1.8.0' not
+found`` - add `STATIC=1` to link libbpf/libelf/libz into the binary instead.
+Their static archives must be reachable, so keep the `-L` above. `STATIC=1`
+also appends `-lzstd`, because the distro `libelf.a` is built with zstd support
+but does not pull it in transitively the way `libelf.so` does - so install
+`libzstd-dev` too:
+
+```
+make STATIC=1 LIBBPF_CFLAGS="-I$KDIR/tools/lib/bpf" \
+     LIBBPF_LIBS="-L$KDIR/tools/lib/bpf -lbpf -lelf -lz"
+```
+
 ## Usage (needs root)
 
 ```
 sudo ./memcg_async_reclaim bench
+sudo ./memcg_async_reclaim lowmin                 # min protection, with baseline
+sudo ./memcg_async_reclaim lowmin --level low --events
 sudo ./memcg_async_reclaim watch -m /sys/fs/cgroup/high -T /sys/fs/cgroup/low -s 10
 ```
 
@@ -93,6 +128,23 @@ bench options:
 | `-f, --file-size BYTES` | workload file size | 32M |
 | `-R, --read-times N` | workload re-read iterations | 50 |
 | `--no-baseline` | skip the run without the BPF program | |
+
+lowmin options (shares `-l`, `-f`, `-R`, `--no-baseline` with bench):
+
+| Option | Meaning | Default |
+|---|---|---|
+| `-L, --level LEVEL` | `low`, `min` or `both`: which policy asserts BELOW | min |
+| `--events` | also read `prot`'s `memory.events` low count | off |
+
+Sizing is chosen per level so the demo is clean and OOM-free. With `--level
+min` (the default), `prot` is hard-protected and immune to reclaim, so its fill
+must stay below the parent limit or `victim` is left nothing reclaimable and
+the memcg OOMs: `-f` defaults to 3/4 of `-l`. With `--level low` the protection
+is soft and cannot OOM, so `-f` defaults to a gentler 5/8 of `-l` - low enough
+that `victim` alone absorbs the reclaim and `prot` is never breached (its
+`memory.events` low count stays 0). An explicit `-f >= -l` is shrunk to 3/4 of
+the limit with a note. For any visible effect the two children together must
+still exceed the limit (`2 * -f > -l`).
 
 watch options:
 
@@ -120,8 +172,8 @@ median of 2.0s with the asynchronous reclaim versus 15.3s baseline, a
 
 | File | Role |
 |---|---|
-| `memcg_async_reclaim.bpf.c` | BPF side: timer/wq chain, refault trigger, reclaim rounds |
-| `memcg_async_reclaim_user.c` | CLI, bench harness, watch daemon |
+| `memcg_async_reclaim.bpf.c` | BPF side: timer/wq chain, refault trigger, reclaim rounds, low/min protection policy |
+| `memcg_async_reclaim_user.c` | CLI, bench harness, lowmin protection demo, watch daemon |
 | `memcg_async_reclaim.h` | shared config and ringbuf event structs |
 | `cgroup_helpers.[ch]` | vendored from the kernel's selftests |
 | `compat.h` | `READ_ONCE`/`WRITE_ONCE`/`__maybe_unused` fallbacks |

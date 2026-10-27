@@ -7,18 +7,23 @@
  * bpf_proactive_reclaim(). The monitored workload is never blocked: reclaim
  * runs asynchronously, in bounded batches, against somebody else's memory.
  *
- * Two modes:
+ * Three modes:
  *
- *   bench  Create a high/low priority cgroup pair, run a memory-pressured
- *          workload in both, and report the effect on the pressured one. By
- *          default the same workload is first run without the BPF program to
- *          produce a baseline. Self-contained: creates and removes everything.
+ *   bench   Create a high/low priority cgroup pair, run a memory-pressured
+ *           workload in both, and report the effect on the pressured one. By
+ *           default the same workload is first run without the BPF program to
+ *           produce a baseline. Self-contained: creates and removes everything.
  *
- *   watch  Watch two existing cgroups given by path and keep reclaiming for as
- *          long as the program runs. Removing the target while it runs is
- *          handled: reclaim stops and the events say so.
+ *   lowmin  Like bench, but protect a cgroup with the memory.low/memory.min
+ *           BPF policy hooks (bpf_memcg_ops) instead of refault-driven reclaim:
+ *           the parent is reclaimed under memory.max and the hook keeps the
+ *           protected child's cache hot. Configurable to use low or min.
  *
- * Both modes need root.
+ *   watch   Watch two existing cgroups given by path and keep reclaiming for as
+ *           long as the program runs. Removing the target while it runs is
+ *           handled: reclaim stops and the events say so.
+ *
+ * All modes need root.
  */
 
 #define _GNU_SOURCE
@@ -72,8 +77,19 @@
 #define BENCH_CG_HIGH_DIR	BENCH_CG_DIR "/high"
 #define BENCH_CG_LOW_DIR	BENCH_CG_DIR "/low"
 
+#define LOWMIN_CG_DIR		"/memcg_lowmin"
+#define LOWMIN_CG_PROT_DIR	LOWMIN_CG_DIR "/prot"
+#define LOWMIN_CG_VICTIM_DIR	LOWMIN_CG_DIR "/victim"
+
 /* How long a single ring_buffer__poll() blocks while waiting for a signal. */
 #define POLL_SLICE_MS		200
+
+/* Which protection hook asserts BELOW in lowmin mode. */
+enum protect_level {
+	LEVEL_MIN = 0,	/* default: hard memory.min protection */
+	LEVEL_LOW,
+	LEVEL_BOTH,
+};
 
 struct options {
 	/* shared */
@@ -93,6 +109,9 @@ struct options {
 	const char *target_path;
 	unsigned long duration_sec;
 	unsigned long stats_sec;
+	/* lowmin (reuses cg_limit/file_size/read_times/no_baseline above) */
+	int prot_level;		/* enum protect_level */
+	bool events;
 };
 
 struct counters {
@@ -689,11 +708,13 @@ static int reap_child(pid_t *pid, const char *who)
 }
 
 /*
- * Run the workload in the high and low priority cgroups at the same time and
- * report how long each took. The high priority one is the cgroup the BPF
- * program protects, the low priority one is what it reclaims from.
+ * Run the workload in two cgroups at the same time and report how long each
+ * took. The two paths name the cgroups to join: bench passes its high/low pair,
+ * lowmin passes its prot/victim pair. The "high" slot is the primary cgroup
+ * (the protected one), the "low" slot the secondary (the reclaimed one).
  */
-static int run_workload(const char *dir, const struct options *o,
+static int run_workload(const char *dir, const char *high_path,
+			const char *low_path, const struct options *o,
 			double *high_elapsed, double *low_elapsed)
 {
 	char high_data[PATH_MAX], low_data[PATH_MAX];
@@ -729,7 +750,7 @@ static int run_workload(const char *dir, const struct options *o,
 		goto cleanup;
 	}
 	if (low_pid == 0)
-		_exit(child_work(BENCH_CG_LOW_DIR, low_data_fd, low_time_fd, o));
+		_exit(child_work(low_path, low_data_fd, low_time_fd, o));
 
 	high_pid = fork();
 	if (high_pid < 0) {
@@ -737,7 +758,7 @@ static int run_workload(const char *dir, const struct options *o,
 		goto cleanup;
 	}
 	if (high_pid == 0)
-		_exit(child_work(BENCH_CG_HIGH_DIR, high_data_fd, high_time_fd, o));
+		_exit(child_work(high_path, high_data_fd, high_time_fd, o));
 
 	if (reap_child(&low_pid, "low"))
 		goto cleanup;
@@ -811,7 +832,8 @@ static int do_bench(struct options *o)
 
 	if (!o->no_baseline) {
 		printf("baseline run (no BPF program)...\n");
-		if (run_workload(dir, o, &base_high, &base_low))
+		if (run_workload(dir, BENCH_CG_HIGH_DIR, BENCH_CG_LOW_DIR, o,
+				 &base_high, &base_low))
 			goto out;
 
 		/*
@@ -830,7 +852,8 @@ static int do_bench(struct options *o)
 		goto out;
 
 	printf("reclaim run (BPF program active)...\n");
-	if (run_workload(dir, o, &high, &low))
+	if (run_workload(dir, BENCH_CG_HIGH_DIR, BENCH_CG_LOW_DIR, o,
+			 &high, &low))
 		goto out;
 
 	printf("\nworkload: file_size=%lu read_times=%lu memory.max=%lu\n",
@@ -845,6 +868,257 @@ static int do_bench(struct options *o)
 
 out:
 	session_stop(&s);
+	cleanup_cgroup_environment();
+
+	return ret;
+}
+
+/* lowmin mode code */
+
+/*
+ * Set up the lowmin topology: a parent with memory.max and swap off, plus a
+ * protected child (prot) and a victim child (victim). Returns prot's id and an
+ * open fd to prot, which bpf_map__attach_cgroup_opts() needs and which is later
+ * reused to read prot's memory.events. The caller closes prot_fd and tears the
+ * environment down.
+ */
+static int setup_lowmin_cgroups(const struct options *o, __u64 *prot_id,
+				int *prot_fd)
+{
+	char limit_buf[32];
+	int fd;
+
+	*prot_fd = -1;
+
+	if (setup_cgroup_environment()) {
+		fprintf(stderr, "ERROR: failed to set up the cgroup environment\n");
+		return -1;
+	}
+
+	fd = create_and_get_cgroup(LOWMIN_CG_DIR);
+	if (fd < 0)
+		goto err;
+	close(fd);
+
+	if (enable_controllers(LOWMIN_CG_DIR, "memory"))
+		goto err;
+
+	snprintf(limit_buf, sizeof(limit_buf), "%lu", o->cg_limit);
+	if (write_cgroup_file(LOWMIN_CG_DIR, "memory.max", limit_buf))
+		goto err;
+	if (disable_swap(LOWMIN_CG_DIR))
+		goto err;
+
+	fd = create_and_get_cgroup(LOWMIN_CG_VICTIM_DIR);
+	if (fd < 0)
+		goto err;
+	close(fd);
+
+	/* Keep prot's fd open: needed to attach the ops and to read events. */
+	*prot_fd = create_and_get_cgroup(LOWMIN_CG_PROT_DIR);
+	if (*prot_fd < 0)
+		goto err;
+
+	*prot_id = get_cgroup_id(LOWMIN_CG_PROT_DIR);
+	if (!*prot_id) {
+		fprintf(stderr, "ERROR: failed to read the prot cgroup id\n");
+		goto err;
+	}
+
+	return 0;
+
+err:
+	if (*prot_fd >= 0)
+		close(*prot_fd);
+	*prot_fd = -1;
+	cleanup_cgroup_environment();
+
+	return -1;
+}
+
+/* Read one "key value" line from a cgroup file via an open cgroup dir fd. */
+static int read_cgroup_event_fd(int cgfd, const char *file, const char *key,
+				unsigned long *out)
+{
+	char line[128], k[64];
+	unsigned long v;
+	int fd, found = 0;
+	FILE *fp;
+
+	fd = openat(cgfd, file, O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	fp = fdopen(fd, "r");
+	if (!fp) {
+		close(fd);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), fp))
+		if (sscanf(line, "%63s %lu", k, &v) == 2 && !strcmp(k, key)) {
+			*out = v;
+			found = 1;
+			break;
+		}
+
+	fclose(fp);	/* also closes fd */
+
+	return found ? 0 : -1;
+}
+
+static struct bpf_link *attach_prot_ops(struct memcg_async_reclaim *skel,
+					int prot_fd)
+{
+	struct bpf_link *link;
+
+	link = bpf_map__attach_cgroup_opts(skel->maps.prot_ops, prot_fd, NULL);
+	if (!link)
+		fprintf(stderr, "ERROR: failed to attach the protection ops: %s\n",
+			strerror(errno));
+
+	return link;
+}
+
+static const char *level_str(int level)
+{
+	switch (level) {
+	case LEVEL_LOW:
+		return "low";
+	case LEVEL_BOTH:
+		return "both";
+	default:
+		return "min";
+	}
+}
+
+static int do_lowmin(struct options *o)
+{
+	double base_prot = 0.0, base_victim = 0.0;
+	double prot_t = 0.0, victim_t = 0.0;
+	struct memcg_async_reclaim *skel = NULL;
+	struct bpf_link *link = NULL;
+	int assert_low, assert_min;
+	__u64 prot_id = 0;
+	int prot_fd = -1;
+	const char *dir;
+	int ret = 1;
+
+	dir = workload_files_dir();
+	if (!dir) {
+		fprintf(stderr, "ERROR: neither /tmp nor the working directory is on a\n"
+			"       writable regular filesystem; the workload needs one\n"
+			"       because tmpfs pages are not reclaimable without swap.\n");
+		return 1;
+	}
+
+	assert_low = (o->prot_level == LEVEL_LOW || o->prot_level == LEVEL_BOTH);
+	assert_min = (o->prot_level == LEVEL_MIN || o->prot_level == LEVEL_BOTH);
+
+	/*
+	 * Safety net for an explicit -f (the per-level defaults are sized in
+	 * main()). Under hard min protection 'prot' is immune to reclaim, so if
+	 * its fill could reach the whole parent limit, 'victim' is left nothing
+	 * reclaimable and the memcg OOMs; shrink it below the limit. low is soft
+	 * and cannot OOM, but staying below the limit also keeps 'prot' from
+	 * being breached. Reclaim only happens once the two children together
+	 * exceed the limit, so warn when they would both fit and there is
+	 * nothing to show.
+	 */
+	if (o->file_size >= o->cg_limit) {
+		o->file_size = o->cg_limit / 4 * 3;
+		printf("note: --file-size >= --limit; using file-size=%luM so the protected\n"
+		       "      'prot' cannot fill the parent and OOM 'victim'\n",
+		       o->file_size / (1024 * 1024));
+	}
+	if (2 * o->file_size <= o->cg_limit)
+		printf("note: 2 * file-size <= limit; both children fit under the parent,\n"
+		       "      so little is reclaimed and the effect may be small\n");
+
+	printf("lowmin: parent=%s (max=%luM) prot=prot victim=victim level=%s fill=%luM\n",
+	       LOWMIN_CG_DIR, o->cg_limit / (1024 * 1024), level_str(o->prot_level),
+	       o->file_size / (1024 * 1024));
+
+	/* Baseline: the same workload with no protection attached. */
+	if (!o->no_baseline) {
+		if (setup_lowmin_cgroups(o, &prot_id, &prot_fd))
+			return 1;
+
+		printf("baseline run (no ops)...\n");
+		if (run_workload(dir, LOWMIN_CG_PROT_DIR, LOWMIN_CG_VICTIM_DIR,
+				 o, &base_prot, &base_victim))
+			goto out;
+
+		/* Reset to a cold state, as bench does between its two runs. */
+		close(prot_fd);
+		prot_fd = -1;
+		cleanup_cgroup_environment();
+	}
+
+	/* Protected: load the policy, attach it to prot, run the workload again. */
+	if (setup_lowmin_cgroups(o, &prot_id, &prot_fd))
+		return 1;
+
+	skel = memcg_async_reclaim__open();
+	if (!skel) {
+		fprintf(stderr, "ERROR: failed to open the BPF object\n");
+		goto out;
+	}
+
+	/* Set the policy globals before load, like the kernel selftest does. */
+	skel->bss->prot_cgroup_id = prot_id;
+	skel->bss->prot_assert_low = assert_low;
+	skel->bss->prot_assert_min = assert_min;
+
+	if (memcg_async_reclaim__load(skel)) {
+		fprintf(stderr, "ERROR: failed to load the BPF object\n");
+		goto out;
+	}
+
+	link = attach_prot_ops(skel, prot_fd);
+	if (!link)
+		goto out;
+
+	printf("protected run (ops on prot, %s BELOW)...\n", level_str(o->prot_level));
+	if (run_workload(dir, LOWMIN_CG_PROT_DIR, LOWMIN_CG_VICTIM_DIR,
+			 o, &prot_t, &victim_t))
+		goto out;
+
+	printf("  prot_low_calls=%llu prot_min_calls=%llu last_usage=%llu pages last_threshold=%llu\n",
+	       (unsigned long long)skel->bss->prot_low_calls,
+	       (unsigned long long)skel->bss->prot_min_calls,
+	       (unsigned long long)skel->bss->prot_last_usage,
+	       (unsigned long long)skel->bss->prot_last_threshold);
+
+	if (o->events) {
+		unsigned long ev_low = 0;
+
+		if (!read_cgroup_event_fd(prot_fd, "memory.events", "low", &ev_low))
+			printf("  prot memory.events low=%lu\n", ev_low);
+		else
+			fprintf(stderr, "WARNING: cannot read prot memory.events\n");
+	}
+
+	printf("\nworkload: file_size=%lu read_times=%lu memory.max=%lu\n",
+	       o->file_size, o->read_times, o->cg_limit);
+	printf("prot: %.3fs   victim: %.3fs\n", prot_t, victim_t);
+	if (!o->no_baseline) {
+		printf("prot  : baseline=%.3fs protected=%.3fs speedup=%+.1f%%\n",
+		       base_prot, prot_t,
+		       base_prot > 0.0 ? 100.0 * (base_prot - prot_t) / base_prot : 0.0);
+		printf("victim: baseline=%.3fs protected=%.3fs change=%+.1f%%\n",
+		       base_victim, victim_t,
+		       base_victim > 0.0 ? 100.0 * (base_victim - victim_t) / base_victim : 0.0);
+	}
+
+	ret = 0;
+
+out:
+	/* Detach the policy before tearing anything down. */
+	bpf_link__destroy(link);
+	memcg_async_reclaim__destroy(skel);
+	if (prot_fd >= 0)
+		close(prot_fd);
 	cleanup_cgroup_environment();
 
 	return ret;
@@ -954,6 +1228,8 @@ static void usage(const char *prog)
 	       "  bench    create a high/low priority cgroup pair, run a memory\n"
 	       "           pressured workload in both, and report the effect of\n"
 	       "           asynchronous reclaim on the pressured one\n"
+	       "  lowmin   like bench, but protect a cgroup with the memory.low/min\n"
+	       "           BPF policy hooks instead of refault-driven reclaim\n"
 	       "  watch    watch an existing cgroup and reclaim from another one\n"
 	       "           whenever it comes under pressure, until interrupted\n\n"
 	       "Common options:\n"
@@ -975,7 +1251,12 @@ static void usage(const char *prog)
 	       "  -T, --target PATH     cgroup to reclaim from (required)\n"
 	       "  -D, --duration SEC    stop after SEC seconds instead of on signal\n"
 	       "  -s, --stats SEC       print a statistics line every SEC seconds (%d)\n\n"
-	       "BYTES accepts a K, M or G suffix. Both modes need root.\n\n"
+	       "lowmin options (shares -l/-f/-R/--no-baseline with bench; -f defaults to\n"
+	       "                a fraction of -l - 3/4 for min/both, 5/8 for low - so prot\n"
+	       "                stays protected without OOMing victim):\n"
+	       "  -L, --level LEVEL     low | min | both: which policy asserts BELOW (min)\n"
+	       "      --events          also read prot's memory.events low count\n\n"
+	       "BYTES accepts a K, M or G suffix. All modes need root.\n\n"
 	       "One call to bpf_proactive_reclaim() reclaims at most the kernel's\n"
 	       "MEMCG_CHARGE_BATCH pages, so --batch above that limit only means a\n"
 	       "round needs more callbacks, not that a single callback does more.\n",
@@ -988,6 +1269,7 @@ static void usage(const char *prog)
 
 enum {
 	OPT_NO_BASELINE = 256,
+	OPT_EVENTS,
 };
 
 static int parse_options(int argc, char **argv, struct options *o)
@@ -1008,11 +1290,13 @@ static int parse_options(int argc, char **argv, struct options *o)
 		{ "target",	required_argument,	NULL, 'T' },
 		{ "duration",	required_argument,	NULL, 'D' },
 		{ "stats",	required_argument,	NULL, 's' },
+		{ "level",	required_argument,	NULL, 'L' },
+		{ "events",	no_argument,		NULL, OPT_EVENTS },
 		{ }
 	};
 	int c;
 
-	while ((c = getopt_long(argc, argv, "i:t:b:n:S:vhl:f:R:m:T:D:s:",
+	while ((c = getopt_long(argc, argv, "i:t:b:n:S:vhl:f:R:m:T:D:s:L:",
 				long_opts, NULL)) != -1) {
 		switch (c) {
 		case 'i':
@@ -1067,6 +1351,21 @@ static int parse_options(int argc, char **argv, struct options *o)
 			if (parse_ulong(optarg, &o->stats_sec))
 				return -1;
 			break;
+		case 'L':
+			if (!strcmp(optarg, "low"))
+				o->prot_level = LEVEL_LOW;
+			else if (!strcmp(optarg, "min"))
+				o->prot_level = LEVEL_MIN;
+			else if (!strcmp(optarg, "both"))
+				o->prot_level = LEVEL_BOTH;
+			else {
+				fprintf(stderr, "ERROR: --level must be low, min or both\n");
+				return -1;
+			}
+			break;
+		case OPT_EVENTS:
+			o->events = true;
+			break;
 		default:
 			return -1;
 		}
@@ -1083,12 +1382,13 @@ int main(int argc, char **argv)
 		.max_batches = DEFAULT_MAX_BATCHES,
 		.swappiness = DEFAULT_SWAPPINESS,
 		.cg_limit = DEFAULT_CG_LIMIT,
-		.file_size = DEFAULT_FILE_SIZE,
+		/* file_size stays 0 here; defaulted per mode below (bench/lowmin differ) */
 		.read_times = DEFAULT_READ_TIMES,
 		.stats_sec = DEFAULT_STATS_SEC,
+		.prot_level = LEVEL_MIN,
 	};
 	const char *mode;
-	bool bench;
+	bool bench, lowmin;
 
 	if (argc < 2) {
 		usage(argv[0]);
@@ -1102,8 +1402,9 @@ int main(int argc, char **argv)
 	}
 
 	bench = !strcmp(mode, "bench");
-	if (!bench && strcmp(mode, "watch")) {
-		fprintf(stderr, "ERROR: unknown mode '%s', expected bench or watch\n\n",
+	lowmin = !strcmp(mode, "lowmin");
+	if (!bench && !lowmin && strcmp(mode, "watch")) {
+		fprintf(stderr, "ERROR: unknown mode '%s', expected bench, lowmin or watch\n\n",
 			mode);
 		usage(argv[0]);
 		return 1;
@@ -1118,6 +1419,21 @@ int main(int argc, char **argv)
 
 	if (!o.interval_ms)
 		o.interval_ms = bench ? BENCH_INTERVAL_MS : WATCH_INTERVAL_MS;
+	if (!o.file_size) {
+		/*
+		 * lowmin sizes the fill from the parent limit so the demo is
+		 * clean and OOM-free; see do_lowmin(). low is soft and cannot
+		 * OOM, so it uses gentler pressure (5/8) that victim absorbs
+		 * without prot being breached. min/both are hard, so prot's fill
+		 * must stay below the limit (3/4) or victim OOMs.
+		 */
+		if (!lowmin)
+			o.file_size = DEFAULT_FILE_SIZE;
+		else if (o.prot_level == LEVEL_LOW)
+			o.file_size = o.cg_limit / 8 * 5;
+		else
+			o.file_size = o.cg_limit / 4 * 3;
+	}
 	if (!o.stats_sec)
 		o.stats_sec = DEFAULT_STATS_SEC;
 	if (!o.threshold || !o.batch_bytes || !o.max_batches) {
@@ -1138,5 +1454,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	return bench ? do_bench(&o) : do_watch(&o);
+	if (bench)
+		return do_bench(&o);
+	if (lowmin)
+		return do_lowmin(&o);
+	return do_watch(&o);
 }

@@ -18,8 +18,24 @@ VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 LIBBPF_CFLAGS ?=
 LIBBPF_LIBS   ?= -lbpf -lelf -lz
 
-CFLAGS  := -Wall -O2 -g $(LIBBPF_CFLAGS)
+# STATIC=1 links libbpf (and libelf/libz) into the binary instead of against
+# their shared libraries. Use it when the binary was built against a newer
+# libbpf than the one the runtime finds, which otherwise fails with e.g.
+#   version `LIBBPF_1.8.0' not found (required by ./memcg_async_reclaim)
+# -lzstd is appended automatically: the distro libelf.a is built with zstd
+# support but, unlike libelf.so, does not pull libzstd in transitively, so
+# install libzstd-dev. The static archives must be reachable, so pair STATIC=1
+# with a LIBBPF_LIBS whose -L points at the build that has libbpf.a:
+#   make STATIC=1 LIBBPF_CFLAGS="-I$(KDIR)/tools/lib/bpf" \
+#                LIBBPF_LIBS="-L$(KDIR)/tools/lib/bpf -lbpf -lelf -lz"
+STATIC ?=
+ifeq ($(STATIC),1)
+LDFLAGS := -Wl,-Bstatic $(LIBBPF_LIBS) -lzstd -Wl,-Bdynamic
+else
 LDFLAGS := $(LIBBPF_LIBS)
+endif
+
+CFLAGS  := -Wall -O2 -g $(LIBBPF_CFLAGS)
 
 TARGET := memcg_async_reclaim
 

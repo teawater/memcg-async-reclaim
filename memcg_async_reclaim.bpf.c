@@ -13,6 +13,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
 
 #include "memcg_async_reclaim.h"
 
@@ -345,5 +346,61 @@ int reclaim_prog_init(struct reclaim_cfg *ctx)
 
 	return bpf_timer_start(&elem->timer, elem->check_ns, 0);
 }
+
+/*
+ * lowmin mode: memory.low / memory.min protection policy.
+ *
+ * These struct_ops are attached to the protected cgroup. The kernel consults
+ * them while reclaiming one of its ancestors: returning BELOW tells the kernel
+ * to treat the cgroup as below its (zero) threshold and skip it, so the
+ * protected cgroup keeps its cache and the sibling absorbs the reclaim.
+ *
+ * Only low_policy and min_policy are bound. high_policy is deliberately left
+ * unset: this mode does not depend on it.
+ *
+ * The globals are __u64/__u32 rather than u64/u32 for the same reason as the
+ * statistics above: bpftool emits the type name verbatim into the skeleton and
+ * the loader has no kernel typedefs.
+ */
+__u64 prot_cgroup_id;		/* protected cgroup id; 0 disables the id filter */
+__u32 prot_assert_low;		/* low_policy returns BELOW when set */
+__u32 prot_assert_min;		/* min_policy returns BELOW when set */
+__u64 prot_low_calls;		/* times low_policy was consulted */
+__u64 prot_min_calls;		/* times min_policy was consulted */
+__u64 prot_last_usage;		/* last ctx->usage, in pages */
+__u64 prot_last_threshold;	/* last ctx->threshold; the demo keeps it 0 so the kernel must ask BPF */
+
+/* BPF_PROG() names the raw argument array "ctx", hence "mctx" here. */
+SEC("struct_ops")
+__u32 BPF_PROG(prot_low_policy, const struct bpf_memcg_prot_ctx *mctx)
+{
+	if (prot_cgroup_id && mctx->cgroup_id != prot_cgroup_id)
+		return BPF_MEMCG_PROT_NO_OPINION;
+
+	__sync_fetch_and_add(&prot_low_calls, 1);
+	prot_last_usage = mctx->usage;
+	prot_last_threshold = mctx->threshold;
+
+	return prot_assert_low ? BPF_MEMCG_PROT_BELOW : BPF_MEMCG_PROT_NO_OPINION;
+}
+
+SEC("struct_ops")
+__u32 BPF_PROG(prot_min_policy, const struct bpf_memcg_prot_ctx *mctx)
+{
+	if (prot_cgroup_id && mctx->cgroup_id != prot_cgroup_id)
+		return BPF_MEMCG_PROT_NO_OPINION;
+
+	__sync_fetch_and_add(&prot_min_calls, 1);
+	prot_last_usage = mctx->usage;
+	prot_last_threshold = mctx->threshold;
+
+	return prot_assert_min ? BPF_MEMCG_PROT_BELOW : BPF_MEMCG_PROT_NO_OPINION;
+}
+
+SEC(".struct_ops.link")
+struct bpf_memcg_ops prot_ops = {
+	.low_policy = (void *)prot_low_policy,
+	.min_policy = (void *)prot_min_policy,
+};
 
 char _license[] SEC("license") = "GPL";
