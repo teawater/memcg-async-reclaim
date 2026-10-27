@@ -403,4 +403,52 @@ struct bpf_memcg_ops prot_ops = {
 	.min_policy = (void *)prot_min_policy,
 };
 
+/*
+ * watch mode: memory.low / memory.min protection for the monitor cgroup.
+ *
+ * Separate from lowmin's prot_ops: the two modes never run in the same process
+ * and an unattached struct_ops costs nothing, so watch gets its own hooks
+ * without disturbing the tested lowmin path. Both members are bound at load
+ * time and watch_control picks which one answers BELOW, so a single link on the
+ * monitor covers every --control combination.
+ *
+ * The id filter is what limits the protection to the monitor. Cgroup struct_ops
+ * run from the *effective* array, which inherits downward, so a link on the
+ * monitor also runs for every descendant the kernel examines -- and
+ * ctx->cgroup_id is that descendant's id, not the cgroup the hook was attached
+ * to (bpf_memcg_prot_policy() fills it from the memcg under examination).
+ */
+__u64 watch_mon_id;		/* monitor cgroup id; any other cgroup is ignored */
+__u32 watch_control;		/* CTL_LOW / CTL_MIN bits that answer BELOW */
+__u64 watch_below_cnt;		/* times a hook answered BELOW */
+
+/* BPF_PROG() names the raw argument array "ctx", hence "mctx" here. */
+SEC("struct_ops")
+__u32 BPF_PROG(watch_low_policy, const struct bpf_memcg_prot_ctx *mctx)
+{
+	if (mctx->cgroup_id != watch_mon_id || !(watch_control & CTL_LOW))
+		return BPF_MEMCG_PROT_NO_OPINION;
+
+	__sync_fetch_and_add(&watch_below_cnt, 1);
+
+	return BPF_MEMCG_PROT_BELOW;
+}
+
+SEC("struct_ops")
+__u32 BPF_PROG(watch_min_policy, const struct bpf_memcg_prot_ctx *mctx)
+{
+	if (mctx->cgroup_id != watch_mon_id || !(watch_control & CTL_MIN))
+		return BPF_MEMCG_PROT_NO_OPINION;
+
+	__sync_fetch_and_add(&watch_below_cnt, 1);
+
+	return BPF_MEMCG_PROT_BELOW;
+}
+
+SEC(".struct_ops.link")
+struct bpf_memcg_ops watch_prot_ops = {
+	.low_policy = (void *)watch_low_policy,
+	.min_policy = (void *)watch_min_policy,
+};
+
 char _license[] SEC("license") = "GPL";

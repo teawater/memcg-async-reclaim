@@ -36,4 +36,22 @@ struct reclaim_event {
 	__u64 outcome;
 };
 
+/*
+ * watch mode method selectors, one bitmask each so the methods stack.
+ *
+ * low and min name the same bpf_memcg_ops hook on both sides: observing it
+ * means treating the kernel consulting the hook as the pressure signal,
+ * controlling it means answering BELOW so reclaim skips the monitor cgroup.
+ * They stay separate values because the two differ in kind - min is hard and
+ * can OOM whatever else is in the hierarchy, low is soft and yields when
+ * nothing else can be reclaimed.
+ */
+#define OBS_REFAULT	(1u << 0)	/* timer polls workingset refaults */
+#define OBS_LOW		(1u << 1)	/* low_policy was consulted */
+#define OBS_MIN		(1u << 2)	/* min_policy was consulted */
+
+#define CTL_RECLAIM	(1u << 0)	/* bpf_proactive_reclaim() the target */
+#define CTL_LOW		(1u << 1)	/* low_policy answers BELOW */
+#define CTL_MIN		(1u << 2)	/* min_policy answers BELOW */
+
 #endif /* __MEMCG_ASYNC_RECLAIM_H */

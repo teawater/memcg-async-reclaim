@@ -19,4 +19,9 @@
 #define __maybe_unused __attribute__((unused))
 #endif
 
+/* <linux/kernel.h> has this, but pulling that in would drag in the rest. */
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+
 #endif /* __COMPAT_H */

@@ -7,7 +7,8 @@ cgroup in bounded batches from `bpf_wq` work callbacks, through the
 `bpf_proactive_reclaim()` kfunc; the monitored workload never blocks on the
 reclaim. Its `lowmin` mode instead uses the `bpf_memcg_ops` `memory.low` /
 `memory.min` policy hooks to keep a chosen cgroup's cache hot while the kernel
-reclaims a pressured sibling.
+reclaims a pressured sibling. `watch` can use those same hooks on its monitor
+cgroup too, either alongside reclaim or instead of it.
 
 `bench`/`watch` are the out-of-tree version of a sample submitted to the
 kernel's `samples/bpf` directory as ["samples/bpf: Add memcg async reclaim
@@ -37,10 +38,13 @@ so the protection is purely the BPF policy's (a real threshold would make the
 kernel decide before ever asking BPF). Only `low_policy`/`min_policy` are
 used - this mode does not touch `high_policy`.
 
-**watch** - watches two existing cgroups and keeps reclaiming for as long as
-the program runs, so it can serve as a simple proactive-reclaim daemon.
-Removing the target while it runs is handled: reclaim stops and the events
-say so.
+**watch** - watches an existing cgroup and keeps reclaiming from another one
+for as long as the program runs, so it can serve as a simple proactive-reclaim
+daemon. Removing the target while it runs is handled: reclaim stops and the
+events say so. `--observe` picks how the monitor is watched and `--control`
+what to do about it - reclaim the target, protect the monitor with the
+`memory.low`/`memory.min` BPF hooks, or both; the defaults are the original
+behaviour. See [watch methods](#watch-methods).
 
 ## Requirements
 
@@ -48,8 +52,9 @@ Kernel:
 
 - the `bpf_proactive_reclaim()` kfunc, restricted to `BPF_PROG_TYPE_SYSCALL`
   (not yet in mainline; build a kernel with the patch series applied)
-- for `lowmin`, the `bpf_memcg_ops` struct_ops with `low_policy`/`min_policy`
-  (the memcg_ext protection hooks; shipped by the same patched kernel)
+- for `lowmin`, and for `watch --control low|min`, the `bpf_memcg_ops`
+  struct_ops with `low_policy`/`min_policy` (the memcg_ext protection hooks;
+  shipped by the same patched kernel)
 - `CONFIG_MEMCG`, `CONFIG_BPF_SYSCALL`, `CONFIG_DEBUG_INFO_BTF`
   (`/sys/kernel/btf/vmlinux`), cgroup v2
 - swap only for swappiness `201` (anon-only) or anon-heavy watch workloads
@@ -107,6 +112,9 @@ sudo ./memcg_async_reclaim bench
 sudo ./memcg_async_reclaim lowmin                 # min protection, with baseline
 sudo ./memcg_async_reclaim lowmin --level low --events
 sudo ./memcg_async_reclaim watch -m /sys/fs/cgroup/high -T /sys/fs/cgroup/low -s 10
+sudo ./memcg_async_reclaim watch -m /sys/fs/cgroup/high -T /sys/fs/cgroup/low \
+                                  --control reclaim,low  # reclaim low, protect high
+sudo ./memcg_async_reclaim watch -m /sys/fs/cgroup/high --control min  # protect only
 ```
 
 Common options:
@@ -119,6 +127,9 @@ Common options:
 | `-n, --max-batches N` | callbacks per reclaim round | 32 |
 | `-S, --swappiness N` | `-1` = the memcg's own, `0..200`, `201` = anon only (needs swap) | -1 |
 | `-v, --verbose` | print every reclaim event | off |
+
+`-i`, `-t`, `-b`, `-n` and `-S` configure the reclaim engine, so in watch mode
+they only apply when `--control` includes `reclaim`.
 
 bench options:
 
@@ -151,15 +162,55 @@ watch options:
 | Option | Meaning | Default |
 |---|---|---|
 | `-m, --monitor PATH` | cgroup to watch | required |
-| `-T, --target PATH` | cgroup to reclaim from | required |
+| `-T, --target PATH` | cgroup to reclaim from | required by `--control reclaim` |
 | `-D, --duration SEC` | stop after SEC seconds instead of on signal | |
 | `-s, --stats SEC` | print a statistics line every SEC seconds | 10 |
+| `--observe METHODS` | how the monitor is watched | `refault` |
+| `--control METHODS` | what to do about it | `reclaim` |
 
 `BYTES` accepts a K, M or G suffix.
 
 One `bpf_proactive_reclaim()` call reclaims at most the kernel's
 `MEMCG_CHARGE_BATCH` pages, so `--batch` above that limit only means a
 round needs more callbacks, not that a single callback does more.
+
+### watch methods
+
+Both selectors take a comma-separated list, and repeating the option
+accumulates, so `--control reclaim,low` and `--control reclaim --control low`
+are the same. `low` and `min` name the same `bpf_memcg_ops` hook on both sides:
+observing it means treating the kernel consulting the hook as the pressure
+signal, controlling it means answering `BELOW`.
+
+| `--observe` | Meaning |
+|---|---|
+| `refault` | a timer polls the monitor's workingset refaults; a delta of at least `-t` opens a reclaim round |
+| `low`, `min` | the monitor's `low_policy`/`min_policy` hook being consulted is itself the signal - *not implemented yet, the option is rejected* |
+
+| `--control` | Meaning |
+|---|---|
+| `reclaim` | `bpf_proactive_reclaim()` the target in bounded batches when an observation opens a round |
+| `low` | the monitor's `low_policy` answers `BELOW`, so reclaim skips it. Soft: the kernel retries with `memcg_low_reclaim` and reclaims the monitor anyway once nothing else can give, counting a `memory.events` `low` |
+| `min` | the monitor's `min_policy` answers `BELOW`. Hard: the monitor is skipped outright, and if nothing else in the hierarchy is reclaimable the memcg OOMs |
+
+With `--control low|min` the periodic statistics line gains `below=N(+M)`, the
+number of times a hook answered `BELOW`. Five things to know:
+
+- The hook is only consulted while the kernel reclaims one of the monitor's
+  *ancestors*; reclaiming the monitor itself never asks. So the protection does
+  something only when the monitor sits under a pressured parent - typically a
+  sibling of the target below a common `memory.max`. Otherwise `below` stays 0.
+- A real `memory.low`/`memory.min` on the monitor that already covers its usage
+  makes the kernel decide before it ever asks BPF, so the hook never runs.
+  Leave both unset.
+- The kernel checks `min` before `low` and a `BELOW` from `min` skips the
+  cgroup outright, so with `--control low,min` the `low` half never runs.
+- The link is on the monitor's cgroup but cgroup struct_ops inherit downward,
+  so the hook also runs for the monitor's descendants; the program filters on
+  the monitor's id, so only the cgroup named by `-m` is protected, not its
+  children. Point `-m` at the cgroup that actually holds the memory.
+- `min` has no usage ceiling: a monitor that keeps growing can starve the
+  target into a memcg OOM. Use `low` when that matters.
 
 ## Results
 
@@ -174,9 +225,9 @@ median of 2.0s with the asynchronous reclaim versus 15.3s baseline, a
 |---|---|
 | `memcg_async_reclaim.bpf.c` | BPF side: timer/wq chain, refault trigger, reclaim rounds, low/min protection policy |
 | `memcg_async_reclaim_user.c` | CLI, bench harness, lowmin protection demo, watch daemon |
-| `memcg_async_reclaim.h` | shared config and ringbuf event structs |
+| `memcg_async_reclaim.h` | shared config, ringbuf event structs, watch method masks |
 | `cgroup_helpers.[ch]` | vendored from the kernel's selftests |
-| `compat.h` | `READ_ONCE`/`WRITE_ONCE`/`__maybe_unused` fallbacks |
+| `compat.h` | `READ_ONCE`/`WRITE_ONCE`/`__maybe_unused`/`ARRAY_SIZE` fallbacks |
 
 ## License
 

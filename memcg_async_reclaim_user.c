@@ -19,9 +19,11 @@
  *           the parent is reclaimed under memory.max and the hook keeps the
  *           protected child's cache hot. Configurable to use low or min.
  *
- *   watch   Watch two existing cgroups given by path and keep reclaiming for as
- *           long as the program runs. Removing the target while it runs is
- *           handled: reclaim stops and the events say so.
+ *   watch   Watch an existing cgroup given by path and keep reclaiming from
+ *           another one for as long as the program runs, or protect the watched
+ *           one with the memory.low/memory.min BPF policy hooks instead of
+ *           reclaiming; --observe and --control pick the methods. Removing the
+ *           target while it runs is handled: reclaim stops and the events say so.
  *
  * All modes need root.
  */
@@ -109,8 +111,11 @@ struct options {
 	const char *target_path;
 	unsigned long duration_sec;
 	unsigned long stats_sec;
+	unsigned int observe_mask;	/* OBS_* bits */
+	unsigned int control_mask;	/* CTL_* bits */
 	/* lowmin (reuses cg_limit/file_size/read_times/no_baseline above) */
 	int prot_level;		/* enum protect_level */
+	bool level_given;	/* -L seen; watch expresses the same via --control */
 	bool events;
 };
 
@@ -118,11 +123,18 @@ struct counters {
 	unsigned long long rounds;
 	unsigned long long calls;
 	unsigned long long bytes;
+	unsigned long long below;
 };
 
 struct session {
 	struct memcg_async_reclaim *skel;
 	struct ring_buffer *rb;
+	/* watch_prot_ops attached to the monitor cgroup; NULL when not protecting. */
+	struct bpf_link *watch_link;
+	/* The cgroup fd the link was attached with, kept open for the link's life. */
+	int mon_fd;
+	/* Whether the timer/wq reclaim engine was started (--control reclaim). */
+	bool reclaim;
 	bool verbose;
 	double start;
 	unsigned long long called;
@@ -219,6 +231,91 @@ static int parse_size(const char *s, unsigned long *out)
 	return 0;
 }
 
+/* watch mode method names, one table per selector. */
+struct method_name {
+	const char *name;
+	unsigned int bit;
+};
+
+static const struct method_name observe_methods[] = {
+	{ "refault",	OBS_REFAULT },
+	{ "low",	OBS_LOW },
+	{ "min",	OBS_MIN },
+};
+
+static const struct method_name control_methods[] = {
+	{ "reclaim",	CTL_RECLAIM },
+	{ "low",	CTL_LOW },
+	{ "min",	CTL_MIN },
+};
+
+/*
+ * Parse a comma-separated method list into a bitmask. Repeating the option
+ * accumulates, so "--control reclaim,min" and "--control reclaim --control min"
+ * mean the same thing. arg is copied because strsep() NUL-terminates in place
+ * and optarg belongs to argv.
+ *
+ * An empty list is an error rather than "keep the default": otherwise
+ * --observe "" would silently leave the previous value in place. For the same
+ * reason the caller leaves the mask at 0 and applies the default only after
+ * parsing - seeding it here would make "--control min" mean "reclaim,min".
+ */
+static int parse_methods(const char *arg, unsigned int *mask,
+			 const struct method_name *tab, size_t n,
+			 const char *opt)
+{
+	char buf[64], *p = buf, *tok;
+	size_t len = strlen(arg);
+	unsigned int got = 0;
+	size_t i;
+
+	if (len >= sizeof(buf)) {
+		fprintf(stderr, "ERROR: %s: list too long\n", opt);
+		return -1;
+	}
+	memcpy(buf, arg, len + 1);
+
+	while ((tok = strsep(&p, ",")) != NULL) {
+		if (!*tok)
+			continue;	/* an empty field, e.g. a trailing comma */
+		for (i = 0; i < n; i++)
+			if (!strcmp(tok, tab[i].name))
+				break;
+		if (i == n) {
+			fprintf(stderr, "ERROR: %s: unknown method '%s', expected",
+				opt, tok);
+			for (i = 0; i < n; i++)
+				fprintf(stderr, "%s %s", i ? "," : "",
+					tab[i].name);
+			fprintf(stderr, " (combine several with ',')\n");
+			return -1;
+		}
+		got |= tab[i].bit;
+	}
+
+	if (!got) {
+		fprintf(stderr, "ERROR: %s: no method given\n", opt);
+		return -1;
+	}
+
+	*mask |= got;
+
+	return 0;
+}
+
+/* Render a mask back into the same comma-separated form, for the banner. */
+static void fmt_methods(char *buf, size_t len, unsigned int mask,
+			const struct method_name *tab, size_t n)
+{
+	size_t i, off = 0;
+
+	buf[0] = '\0';
+	for (i = 0; i < n && off < len; i++)
+		if (mask & tab[i].bit)
+			off += snprintf(buf + off, len - off, "%s%s",
+					off ? "," : "", tab[i].name);
+}
+
 static void fmt_bytes(char *buf, size_t len, unsigned long long bytes)
 {
 	if (bytes >= (1ULL << 30))
@@ -280,6 +377,7 @@ static void read_counters(struct session *s, struct counters *c)
 	c->rounds = s->skel->bss->reclaim_rounds;
 	c->calls = s->skel->bss->reclaim_calls;
 	c->bytes = s->skel->bss->reclaimed_bytes;
+	c->below = s->skel->bss->watch_below_cnt;
 }
 
 static int session_start(struct session *s, const struct options *o,
@@ -297,28 +395,71 @@ static int session_start(struct session *s, const struct options *o,
 	LIBBPF_OPTS(bpf_test_run_opts, run_opts,
 		    .ctx_in = &cfg,
 		    .ctx_size_in = sizeof(cfg));
+	bool reclaim = o->control_mask & CTL_RECLAIM;
+	bool protect = o->control_mask & (CTL_LOW | CTL_MIN);
 	int init_fd, err;
 
 	s->verbose = o->verbose;
+	s->mon_fd = -1;
+	s->reclaim = reclaim;
 	s->start = now_sec();
 
-	s->skel = memcg_async_reclaim__open_and_load();
+	s->skel = memcg_async_reclaim__open();
 	if (!s->skel) {
-		fprintf(stderr, "ERROR: failed to open or load the BPF object\n");
+		fprintf(stderr, "ERROR: failed to open the BPF object\n");
 		return -1;
+	}
+
+	/*
+	 * The hooks read their configuration from .bss on every call, so it has
+	 * to be in place before load; there is no map to update afterwards.
+	 */
+	if (protect) {
+		s->skel->bss->watch_mon_id = monitor_id;
+		s->skel->bss->watch_control = o->control_mask;
+	}
+
+	if (memcg_async_reclaim__load(s->skel)) {
+		fprintf(stderr, "ERROR: failed to load the BPF object\n");
+		goto err_out;
+	}
+
+	/*
+	 * One link, on the monitor cgroup, covers every --control combination:
+	 * both hooks are bound at load time and watch_control picks which one
+	 * answers BELOW. The fd has to stay open for the link's lifetime.
+	 */
+	if (protect) {
+		s->mon_fd = open(o->monitor_path, O_RDONLY | O_CLOEXEC);
+		if (s->mon_fd < 0) {
+			fprintf(stderr, "ERROR: cannot open %s: %s\n",
+				o->monitor_path, strerror(errno));
+			goto err_out;
+		}
+
+		s->watch_link = bpf_map__attach_cgroup_opts(s->skel->maps.watch_prot_ops,
+							    s->mon_fd, NULL);
+		if (!s->watch_link) {
+			fprintf(stderr, "ERROR: failed to attach the policy to %s: %s\n",
+				o->monitor_path, strerror(errno));
+			goto err_out;
+		}
 	}
 
 	/*
 	 * The syscall program installs the timer and the work item into the
 	 * map and starts the timer; from then on the chain runs on its own.
+	 * Without --control reclaim there is no target and nothing to drive.
 	 */
-	init_fd = bpf_program__fd(s->skel->progs.reclaim_prog_init);
-	err = bpf_prog_test_run_opts(init_fd, &run_opts);
-	if (err || run_opts.retval) {
-		fprintf(stderr, "ERROR: reclaim_prog_init failed: %s (retval %d)\n",
-			err ? strerror(errno) : "rejected by the program",
-			run_opts.retval);
-		goto err_out;
+	if (reclaim) {
+		init_fd = bpf_program__fd(s->skel->progs.reclaim_prog_init);
+		err = bpf_prog_test_run_opts(init_fd, &run_opts);
+		if (err || run_opts.retval) {
+			fprintf(stderr, "ERROR: reclaim_prog_init failed: %s (retval %d)\n",
+				err ? strerror(errno) : "rejected by the program",
+				run_opts.retval);
+			goto err_out;
+		}
 	}
 
 	s->rb = ring_buffer__new(bpf_map__fd(s->skel->maps.reclaim_events),
@@ -333,8 +474,14 @@ static int session_start(struct session *s, const struct options *o,
 	return 0;
 
 err_out:
+	bpf_link__destroy(s->watch_link);
+	s->watch_link = NULL;
 	memcg_async_reclaim__destroy(s->skel);
 	s->skel = NULL;
+	if (s->mon_fd >= 0) {
+		close(s->mon_fd);
+		s->mon_fd = -1;
+	}
 
 	return -1;
 }
@@ -368,9 +515,13 @@ static void print_counters(struct session *s, const char *prefix)
 	fmt_bytes(bytes, sizeof(bytes), now.bytes);
 	fmt_bytes(delta, sizeof(delta), now.bytes - s->last.bytes);
 
-	printf("%s rounds=%llu(+%llu) calls=%llu(+%llu) reclaimed=%s(+%s)\n",
+	printf("%s rounds=%llu(+%llu) calls=%llu(+%llu) reclaimed=%s(+%s)",
 	       prefix, now.rounds, now.rounds - s->last.rounds,
 	       now.calls, now.calls - s->last.calls, bytes, delta);
+	/* below only moves when the policy is attached; printing 0 forever is noise. */
+	if (s->watch_link)
+		printf(" below=%llu(+%llu)", now.below, now.below - s->last.below);
+	printf("\n");
 
 	s->last = now;
 }
@@ -390,8 +541,9 @@ static void session_stop(struct session *s)
 
 	printf("\nran for %.1fs\n", now_sec() - s->start);
 	print_counters(s, "total:");
-	printf("events: called=%llu skipped_dying=%llu target_gone=%llu\n",
-	       s->called, s->skipped_dying, s->target_gone);
+	if (s->reclaim)
+		printf("events: called=%llu skipped_dying=%llu target_gone=%llu\n",
+		       s->called, s->skipped_dying, s->target_gone);
 	if (failures)
 		printf("WARNING: monitor timer rearm failed %llu time(s), reclaim stopped early\n",
 		       failures);
@@ -399,9 +551,18 @@ static void session_stop(struct session *s)
 		printf("WARNING: bpf_proactive_reclaim() last failed with -%llu\n",
 		       last_err);
 
+	/* The link pins the map, so it has to go before the skeleton does. */
+	bpf_link__destroy(s->watch_link);
+	s->watch_link = NULL;
+
 	/* Destroying the skeleton drops the map, which cancels timer and wq. */
 	memcg_async_reclaim__destroy(s->skel);
 	s->skel = NULL;
+
+	if (s->mon_fd >= 0) {
+		close(s->mon_fd);
+		s->mon_fd = -1;
+	}
 }
 
 /* watch mode setup code */
@@ -446,6 +607,26 @@ static bool memcg_on_path(const char *path)
 	close(fd);
 
 	return true;
+}
+
+/* Resolve a user-supplied cgroup path and check the memory controller is on. */
+static int resolve_memcg(const char *path, __u64 *id)
+{
+	*id = cgroup_id_from_path(path);
+	if (!*id) {
+		fprintf(stderr, "ERROR: cannot resolve %s: %s\n", path,
+			strerror(errno));
+		return -1;
+	}
+
+	if (!memcg_on_path(path)) {
+		fprintf(stderr, "ERROR: %s has no memory.current; the memory\n"
+			"       controller is not enabled on that cgroup.\n",
+			path);
+		return -1;
+	}
+
+	return 0;
 }
 
 /* bench mode code */
@@ -1129,40 +1310,39 @@ out:
 static int do_watch(struct options *o)
 {
 	struct session s = {};
-	__u64 monitor_id, target_id;
+	__u64 monitor_id, target_id = 0;
+	bool reclaim = o->control_mask & CTL_RECLAIM;
+	char obs[32], ctl[32];
 	double next_stats, deadline = 0;
 	int ret = 1;
 
-	if (!o->monitor_path || !o->target_path) {
-		fprintf(stderr, "ERROR: watch needs both --monitor and --target\n");
+	/*
+	 * Observing through the low/min hooks means counting them and reporting
+	 * what they saw, which is not built yet. Reject it rather than accept a
+	 * mask bit that does nothing: a counter stuck at 0 would then be
+	 * indistinguishable from "the kernel never consulted the hook", which is
+	 * a real failure mode that deserves to keep that meaning to itself.
+	 */
+	if (o->observe_mask & (OBS_LOW | OBS_MIN)) {
+		fprintf(stderr, "ERROR: --observe low|min is not implemented yet; so far\n"
+			"       watch can only observe refaults\n");
 		return 1;
 	}
 
-	monitor_id = cgroup_id_from_path(o->monitor_path);
-	if (!monitor_id) {
-		fprintf(stderr, "ERROR: cannot resolve %s: %s\n", o->monitor_path,
-			strerror(errno));
+	if (!o->monitor_path) {
+		fprintf(stderr, "ERROR: watch needs --monitor\n");
 		return 1;
 	}
-	if (!memcg_on_path(o->monitor_path)) {
-		fprintf(stderr, "ERROR: %s has no memory.current; the memory\n"
-			"       controller is not enabled on that cgroup.\n",
-			o->monitor_path);
+	if (reclaim && !o->target_path) {
+		fprintf(stderr, "ERROR: --control reclaim needs --target\n");
 		return 1;
 	}
 
-	target_id = cgroup_id_from_path(o->target_path);
-	if (!target_id) {
-		fprintf(stderr, "ERROR: cannot resolve %s: %s\n", o->target_path,
-			strerror(errno));
+	if (resolve_memcg(o->monitor_path, &monitor_id))
 		return 1;
-	}
-	if (!memcg_on_path(o->target_path)) {
-		fprintf(stderr, "ERROR: %s has no memory.current; the memory\n"
-			"       controller is not enabled on that cgroup.\n",
-			o->target_path);
+	/* Without --control reclaim there is no engine and nothing to reclaim. */
+	if (reclaim && resolve_memcg(o->target_path, &target_id))
 		return 1;
-	}
 
 	if (session_start(&s, o, monitor_id, target_id))
 		return 1;
@@ -1170,13 +1350,21 @@ static int do_watch(struct options *o)
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 
+	fmt_methods(obs, sizeof(obs), o->observe_mask, observe_methods,
+		    ARRAY_SIZE(observe_methods));
+	fmt_methods(ctl, sizeof(ctl), o->control_mask, control_methods,
+		    ARRAY_SIZE(control_methods));
+
 	printf("monitor: %s (id %llu)\n", o->monitor_path,
 	       (unsigned long long)monitor_id);
-	printf("target:  %s (id %llu)\n", o->target_path,
-	       (unsigned long long)target_id);
-	printf("interval=%lums threshold=%lu batch=%lu max_batches=%lu swappiness=%ld\n",
-	       o->interval_ms, o->threshold, o->batch_bytes, o->max_batches,
-	       o->swappiness);
+	if (reclaim)
+		printf("target:  %s (id %llu)\n", o->target_path,
+		       (unsigned long long)target_id);
+	printf("observe=%s control=%s\n", obs, ctl);
+	if (reclaim)
+		printf("interval=%lums threshold=%lu batch=%lu max_batches=%lu swappiness=%ld\n",
+		       o->interval_ms, o->threshold, o->batch_bytes, o->max_batches,
+		       o->swappiness);
 	if (o->duration_sec)
 		printf("running for %lus, ", o->duration_sec);
 	printf("interrupt with SIGINT to stop\n\n");
@@ -1231,7 +1419,8 @@ static void usage(const char *prog)
 	       "  lowmin   like bench, but protect a cgroup with the memory.low/min\n"
 	       "           BPF policy hooks instead of refault-driven reclaim\n"
 	       "  watch    watch an existing cgroup and reclaim from another one\n"
-	       "           whenever it comes under pressure, until interrupted\n\n"
+	       "           whenever it comes under pressure, until interrupted;\n"
+	       "           --control can protect the watched one instead\n\n"
 	       "Common options:\n"
 	       "  -i, --interval MS     monitor tick (bench: %d, watch: %d)\n"
 	       "  -t, --threshold N     refault delta per tick that starts a round (%d)\n"
@@ -1248,9 +1437,18 @@ static void usage(const char *prog)
 	       "      --no-baseline     skip the run without the BPF program\n\n"
 	       "watch options:\n"
 	       "  -m, --monitor PATH    cgroup to watch (required)\n"
-	       "  -T, --target PATH     cgroup to reclaim from (required)\n"
+	       "  -T, --target PATH     cgroup to reclaim from (needed by --control reclaim)\n"
 	       "  -D, --duration SEC    stop after SEC seconds instead of on signal\n"
-	       "  -s, --stats SEC       print a statistics line every SEC seconds (%d)\n\n"
+	       "  -s, --stats SEC       print a statistics line every SEC seconds (%d)\n"
+	       "      --observe METHODS refault | low | min, ','-separated (refault);\n"
+	       "                        low and min are not implemented yet\n"
+	       "      --control METHODS reclaim | low | min, ','-separated (reclaim).\n"
+	       "                        low/min answer BELOW from the monitor's\n"
+	       "                        memory.low/min BPF hook, so reclaim skips it and\n"
+	       "                        --target becomes optional. min is hard and can OOM\n"
+	       "                        the target; low is soft and yields once nothing\n"
+	       "                        else can be reclaimed. Both cover PATH itself,\n"
+	       "                        not its children.\n\n"
 	       "lowmin options (shares -l/-f/-R/--no-baseline with bench; -f defaults to\n"
 	       "                a fraction of -l - 3/4 for min/both, 5/8 for low - so prot\n"
 	       "                stays protected without OOMing victim):\n"
@@ -1270,6 +1468,8 @@ static void usage(const char *prog)
 enum {
 	OPT_NO_BASELINE = 256,
 	OPT_EVENTS,
+	OPT_OBSERVE,
+	OPT_CONTROL,
 };
 
 static int parse_options(int argc, char **argv, struct options *o)
@@ -1292,6 +1492,8 @@ static int parse_options(int argc, char **argv, struct options *o)
 		{ "stats",	required_argument,	NULL, 's' },
 		{ "level",	required_argument,	NULL, 'L' },
 		{ "events",	no_argument,		NULL, OPT_EVENTS },
+		{ "observe",	required_argument,	NULL, OPT_OBSERVE },
+		{ "control",	required_argument,	NULL, OPT_CONTROL },
 		{ }
 	};
 	int c;
@@ -1352,6 +1554,7 @@ static int parse_options(int argc, char **argv, struct options *o)
 				return -1;
 			break;
 		case 'L':
+			o->level_given = true;
 			if (!strcmp(optarg, "low"))
 				o->prot_level = LEVEL_LOW;
 			else if (!strcmp(optarg, "min"))
@@ -1365,6 +1568,20 @@ static int parse_options(int argc, char **argv, struct options *o)
 			break;
 		case OPT_EVENTS:
 			o->events = true;
+			break;
+		case OPT_OBSERVE:
+			if (parse_methods(optarg, &o->observe_mask,
+					  observe_methods,
+					  ARRAY_SIZE(observe_methods),
+					  "--observe"))
+				return -1;
+			break;
+		case OPT_CONTROL:
+			if (parse_methods(optarg, &o->control_mask,
+					  control_methods,
+					  ARRAY_SIZE(control_methods),
+					  "--control"))
+				return -1;
 			break;
 		default:
 			return -1;
@@ -1385,10 +1602,11 @@ int main(int argc, char **argv)
 		/* file_size stays 0 here; defaulted per mode below (bench/lowmin differ) */
 		.read_times = DEFAULT_READ_TIMES,
 		.stats_sec = DEFAULT_STATS_SEC,
+		/* observe_mask/control_mask stay 0; defaulted after parsing */
 		.prot_level = LEVEL_MIN,
 	};
 	const char *mode;
-	bool bench, lowmin;
+	bool bench, lowmin, watch;
 
 	if (argc < 2) {
 		usage(argv[0]);
@@ -1409,11 +1627,34 @@ int main(int argc, char **argv)
 		usage(argv[0]);
 		return 1;
 	}
+	watch = !bench && !lowmin;	/* an unknown mode has already returned */
 
 	/* Let getopt_long see the options rather than the mode. */
 	optind = 2;
 	if (parse_options(argc, argv, &o)) {
 		usage(argv[0]);
+		return 1;
+	}
+
+	/* Applied here, not in the initializer: see parse_methods(). */
+	if (!o.observe_mask)
+		o.observe_mask = OBS_REFAULT;
+	if (!o.control_mask)
+		o.control_mask = CTL_RECLAIM;
+
+	/*
+	 * The selectors mean something only to watch and --level only to lowmin.
+	 * Silently ignoring them in the wrong mode would look exactly like the
+	 * option having no effect. Comparing against the defaults is enough: any
+	 * other value can only have come from the command line.
+	 */
+	if (!watch && (o.observe_mask != OBS_REFAULT ||
+		       o.control_mask != CTL_RECLAIM)) {
+		fprintf(stderr, "ERROR: --observe/--control are watch options\n");
+		return 1;
+	}
+	if (!lowmin && o.level_given) {
+		fprintf(stderr, "ERROR: --level is a lowmin-mode option (watch uses --control low|min)\n");
 		return 1;
 	}
 
