@@ -34,6 +34,15 @@ ARCH := $(shell uname -m | sed -e 's/x86_64/x86/' \
 CFLAGS  := -Wall -O2 -g $(LIBBPF_CFLAGS)
 LDFLAGS := $(LIBBPF_LIBS)
 
+# STATIC=1 links the binary fully static, so it runs on hosts without the
+# matching shared libraries (e.g. a test VM). Needs libbpf.a (with KDIR the
+# kernel tree's), libelf.a, libz.a and libc.a installed, plus libzstd-dev:
+# distro libelf.a is built with zstd compression support, which dynamic
+# linking resolves automatically but static linking needs -lzstd for.
+ifeq ($(STATIC),1)
+LDFLAGS += -static -lzstd
+endif
+
 TARGET := memcg_async_reclaim
 
 all: $(TARGET)

@@ -61,6 +61,15 @@ Individual pieces can be overridden in either mode: `VMLINUX_BTF` (any
 BTF source, e.g. the `vmlinux` ELF of another build tree), `BPFTOOL`,
 and `LIBBPF_CFLAGS`/`LIBBPF_LIBS` for a source-built libbpf.
 
+A fully static binary can be built with `STATIC=1` (e.g.
+`make STATIC=1 KDIR=/path/to/kernel/linux`). It runs on hosts without the
+matching shared libraries, such as a test VM, and does not depend on the
+rpath to the kernel tree's libbpf. Static linking needs libbpf.a (with
+KDIR the kernel tree's), plus static versions of the system libraries:
+libelf.a, libz.a, libc.a and libzstd.a (package libzstd-dev) - distro
+libelf.a is built with zstd compression support, which dynamic linking
+resolves automatically but static linking needs `-lzstd` for.
+
 The generated skeleton and CO-RE relocations match the selected
 kernel, so the resulting binary is meant to run on it, not necessarily
 on the build host. `vmlinux.h` is only generated when missing: after
