@@ -38,34 +38,34 @@ Build:
 
 - clang (BPF target), bpftool, libbpf development headers and library,
   gcc, make
-- if the distro libbpf is too old for `bpf_wq` skeletons, point
-  `LIBBPF_CFLAGS`/`LIBBPF_LIBS` at a source build, e.g. the kernel's
-  `tools/lib/bpf`
+- if the distro libbpf is too old, `make KDIR=/path/to/kernel/linux`
+  builds against that tree's vmlinux, libbpf and bpftool instead (see
+  [Build](#build))
 
 ## Build
 
 ```
-make
+make KDIR=/path/to/kernel/linux
 ```
 
-`vmlinux.h` is generated from BTF at build time, by default from the
-running kernel's `/sys/kernel/btf/vmlinux`. To build for a different
-kernel, point `VMLINUX_BTF` at its BTF source, e.g. the `vmlinux` ELF of
-a kernel build tree, before running make:
+`KDIR` is the one-stop way to build against a specific kernel tree:
+`vmlinux.h` is generated from that tree's `vmlinux`, and the libbpf
+headers and library plus bpftool (if built) are taken from its
+`tools/` directory instead of the system installs. The tree's
+`tools/lib/bpf` must be built beforehand; the link records an rpath
+to it, so the binary uses it at run time too.
 
-```
-export VMLINUX_BTF=/path/to/kernel/linux/vmlinux
-make
-```
+Without `KDIR`, `vmlinux.h` is generated from the running kernel's
+`/sys/kernel/btf/vmlinux` and the system libbpf/bpftool are used.
+Individual pieces can be overridden in either mode: `VMLINUX_BTF` (any
+BTF source, e.g. the `vmlinux` ELF of another build tree), `BPFTOOL`,
+and `LIBBPF_CFLAGS`/`LIBBPF_LIBS` for a source-built libbpf.
 
-The generated skeleton and CO-RE relocations match that kernel, so the
-resulting binary is meant to run on it, not necessarily on the build
-host. To use a source-built libbpf:
-
-```
-make LIBBPF_CFLAGS="-I$KDIR/tools/lib/bpf" \
-     LIBBPF_LIBS="-L$KDIR/tools/lib/bpf -lbpf -lelf -lz"
-```
+The generated skeleton and CO-RE relocations match the selected
+kernel, so the resulting binary is meant to run on it, not necessarily
+on the build host. `vmlinux.h` is only generated when missing: after
+switching to a different kernel, run `make clean` first so it is
+regenerated.
 
 ## Usage (needs root)
 
