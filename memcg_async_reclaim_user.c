@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <poll.h>
 #include <linux/magic.h>
 #include <signal.h>
 #include <stdio.h>
@@ -46,6 +47,7 @@
 #include "cgroup_helpers.h"
 #include "compat.h"
 #include "memcg_async_reclaim.h"
+#include "policy.h"
 #include "memcg_async_reclaim.skel.h"
 
 /*
@@ -93,6 +95,20 @@ struct options {
 	const char *target_path;
 	unsigned long duration_sec;
 	unsigned long stats_sec;
+	/* cmp */
+	const char *impl_str;
+	const char *trigger_str;
+	const char *csv_path;
+	unsigned long psi_us;
+	unsigned long hysteresis_ms;
+	unsigned long read_cycle_ms;
+	unsigned long filler_sleep_ms;
+	unsigned long budget;
+	unsigned long tmax;
+	unsigned long filler_bytes;
+	unsigned long burst_bytes;
+	unsigned long ramp_sec;
+	unsigned long agent_min;
 };
 
 struct counters {
@@ -532,6 +548,9 @@ enum child_exit_code {
 	CHILD_EXIT_WRITE_FILE,
 	CHILD_EXIT_READ_FILE,
 	CHILD_EXIT_TIME_FILE,
+	CHILD_EXIT_OPEN_FILES,
+	CHILD_EXIT_PSI_OPEN,
+	CHILD_EXIT_PSI_TRIGGER,
 };
 
 static const char *child_exit_str(int code)
@@ -547,6 +566,12 @@ static const char *child_exit_str(int code)
 		return "read data file";
 	case CHILD_EXIT_TIME_FILE:
 		return "write time file";
+	case CHILD_EXIT_OPEN_FILES:
+		return "open memory.current/memory.low";
+	case CHILD_EXIT_PSI_OPEN:
+		return "open memory.pressure";
+	case CHILD_EXIT_PSI_TRIGGER:
+		return "arm PSI trigger";
 	default:
 		return "unknown";
 	}
@@ -682,6 +707,9 @@ static int reap_child(pid_t *pid, const char *who)
 		fprintf(stderr, "ERROR: %s child failed at: %s (exit status %d)\n",
 			who, child_exit_str(WEXITSTATUS(status)),
 			WEXITSTATUS(status));
+		if (WEXITSTATUS(status) == CHILD_EXIT_PSI_OPEN ||
+		    WEXITSTATUS(status) == CHILD_EXIT_PSI_TRIGGER)
+			fprintf(stderr, "       PSI unavailable? boot with psi=1\n");
 		return -1;
 	}
 
@@ -945,6 +973,1172 @@ out:
 	return ret;
 }
 
+/* ===================== cmp: three-arm comparison ===================== */
+
+/*
+ * Topology. setup_cgroup_environment() mounts a private cgroup2 view at
+ * /mnt (this mirrors CGROUP_MOUNT_PATH in cgroup_helpers.c) and enables all
+ * controllers at its root. The budget cgroup T is placed as a direct child
+ * of that root: the helpers' workdir-relative paths would interpose a
+ * cgroup with memory.low == 0 between T and the root, which caps every
+ * request to 0 under global reclaim. The workload pressure here comes from
+ * T's own memory.max, so the reclaim it triggers is rooted at T, and A - a
+ * direct child of T - rides the uncapped parent == root fast path of
+ * page_counter_calculate_protection(); T's memory.low shields the subtree
+ * against system-wide reclaim.
+ *
+ *   /mnt                       cgroup2 root, all controllers enabled
+ *   +-- memcg_cmp_t        T: memory.max = --tmax, memory.low = --budget,
+ *                            memory.swap.max = 0
+ *       |-- a              A: paced re-reader, the protected one
+ *       |-- b              B: continuous rewriter, a renewable cold-page flow
+ *       |-- c              C: one-shot anon ballast, unreclaimable (swap off)
+ *       +-- agent          the U arm's child, memory.min = --agent-min
+ *
+ * The pressure model is a flow, not a stock. B's rewrite loop keeps charging
+ * pages against T's max, so reclaim keeps running for the whole window and
+ * keeps eating the coldest supply - mostly B's own tail, but the proportional
+ * scan visits A as well and evicts whatever A has not referenced since its
+ * last paced pass. Those evictions land in A's pgsteal count: the evidence
+ * all three arms trigger on. (Workingset refaults, the textbook signal, are
+ * blind here: they need the shadow entry the eviction left behind, and the
+ * shadow_nodes shrinker - which runs inside every one of B's reclaim passes -
+ * wipes it long before A's paced re-read. See the BPF side.) Under
+ * protection A is skipped entirely and its pgsteal stops growing. C's anon
+ * ballast shrinks the file pool to (tmax - burst),
+ * raising A's share of the scan; as long as A's full working set plus the
+ * ballast fit under --tmax, the protection floor is met and reclaim never
+ * has to override a request. Two knobs keep the arms distinguishable:
+ * --read-cycle paces A (a tight loop keeps every page referenced hundreds
+ * of times a second and wins any LRU competition outright) and B's loop
+ * renews the fodder (a one-shot filler is eaten once, after which the only
+ * supply left is A - protected or not). --filler must keep A + B under
+ * --tmax: the ramp then has headroom, no reclaim runs, and the arms stay
+ * silent until the burst pushes T over its max - first protection is
+ * measured against the burst, not against ramp-time dribble.
+ *
+ * The agent's memory.min is disclosed: the userspace arm's action path has
+ * to survive the very pressure it is reacting to. It does not close the
+ * window being measured - the agent still only acts between passes.
+ */
+#define CMP_MOUNT_PATH		"/mnt"
+#define CMP_T_DIR		CMP_MOUNT_PATH "/memcg_cmp_t"
+#define CMP_A_DIR		CMP_T_DIR "/a"
+#define CMP_B_DIR		CMP_T_DIR "/b"
+#define CMP_C_DIR		CMP_T_DIR "/c"
+#define CMP_AGENT_DIR		CMP_T_DIR "/agent"
+
+#define DEFAULT_CMP_INTERVAL_MS		5
+#define DEFAULT_CMP_DURATION_SEC	30
+#define DEFAULT_CMP_RAMP_SEC		5
+#define DEFAULT_CMP_RATE		12800UL	/* A usage-drop pages per second */
+#define DEFAULT_CMP_READ_CYCLE_MS	500
+#define DEFAULT_CMP_FILLER_SLEEP_MS	500
+#define DEFAULT_CMP_HYSTERESIS_MS	50
+#define DEFAULT_CMP_BUDGET		(64UL * 1024 * 1024)
+#define DEFAULT_CMP_TMAX		(160UL * 1024 * 1024)
+/* A_full + B_full must stay under --tmax, or the ramp already runs reclaim
+ * and the arms latch protection before the burst they are meant to react to.
+ */
+#define DEFAULT_CMP_FILLER		(112UL * 1024 * 1024)
+#define DEFAULT_CMP_AGENT_MIN		(8UL * 1024 * 1024)
+#define DEFAULT_CMP_PSI_US		10000
+
+/* The poll trigger's window: stall microseconds per 1s of wall time. */
+#define CMP_PSI_WINDOW_US		1000000
+
+enum cmp_impl {
+	CMP_IMPL_USER,
+	CMP_IMPL_BPF_POLL,
+	CMP_IMPL_BPF_HOOK,
+	CMP_IMPL_SANITY,
+};
+
+enum cmp_trigger {
+	CMP_TRIG_TIMER,
+	CMP_TRIG_POLL,
+};
+
+/* Written by the A reader child on SIGTERM; read back by the parent. */
+struct cmp_child_report {
+	__u64 iters;
+	__u64 sum_ns;
+	__u64 max_ns;
+};
+
+/* Written by the U arm's agent child on SIGTERM. Timestamps are
+ * CLOCK_MONOTONIC, the same clock bpf_ktime_get_ns() uses, so the agent's
+ * first_protect_ns is directly comparable with cmp_first_request_ns.
+ */
+struct cmp_agent_report {
+	__u64 decisions;
+	__u64 writes;
+	__u64 first_protect_ns;
+	__u64 sample_sum_ns;
+	__u64 sample_max_ns;
+};
+
+struct cmp_snapshot {
+	unsigned long long steal_a;
+	unsigned long long refault_a;
+	unsigned long long low_events_a;
+	unsigned long long psi_a_us;
+	unsigned long long psi_b_us;
+	unsigned long long cur_a, cur_b, cur_c, cur_t;
+	unsigned long long cpu_a_us, cpu_b_us, cpu_c_us, cpu_agent_us;
+};
+
+static volatile sig_atomic_t cmp_child_stop;
+
+static void cmp_child_handle_term(__maybe_unused int sig)
+{
+	cmp_child_stop = 1;
+}
+
+static __u64 mono_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
+}
+
+/*
+ * Absolute-path cgroup helpers: the cgroup_helpers.c API prepends the
+ * per-process workdir, and cmp's T has to sit at the root of the mount.
+ */
+
+static int cmp_write_str(const char *dir, const char *file, const char *val)
+{
+	char path[PATH_MAX];
+	int fd, ret = -1;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, file);
+	/*
+	 * O_WRONLY: write-only files like /proc/sys/vm/drop_caches reject
+	 * O_RDWR even for root (CAP_DAC_OVERRIDE grants no read when no read
+	 * bit is set at all).
+	 */
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		log_err("opening %s", path);
+		return -1;
+	}
+	if (write(fd, val, strlen(val)) >= 0)
+		ret = 0;
+	else
+		log_err("writing '%s' to %s", val, path);
+	close(fd);
+
+	return ret;
+}
+
+static int cmp_write_ull(const char *dir, const char *file,
+			 unsigned long long val)
+{
+	char buf[32];
+
+	snprintf(buf, sizeof(buf), "%llu", val);
+
+	return cmp_write_str(dir, file, buf);
+}
+
+static int cmp_read_file(const char *dir, const char *file, char *buf,
+			 size_t len)
+{
+	char path[PATH_MAX];
+	ssize_t n;
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, file);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	n = pread(fd, buf, len - 1, 0);
+	close(fd);
+	if (n < 0)
+		return -1;
+	buf[n] = '\0';
+
+	return (int)n;
+}
+
+static unsigned long long cmp_read_ull(const char *dir, const char *file)
+{
+	char buf[64];
+
+	if (cmp_read_file(dir, file, buf, sizeof(buf)) < 0)
+		return 0;
+
+	return strtoull(buf, NULL, 10);
+}
+
+/* Matches "key VALUE" at the start of a line; a missing key reads as 0. */
+static unsigned long long cmp_parse_key(const char *buf, const char *key)
+{
+	size_t klen = strlen(key);
+	const char *p = buf;
+
+	while (p && *p) {
+		if (!strncmp(p, key, klen) && p[klen] == ' ')
+			return strtoull(p + klen + 1, NULL, 10);
+		p = strchr(p, '\n');
+		if (p)
+			p++;
+	}
+
+	return 0;
+}
+
+static unsigned long long cmp_events_low(const char *dir)
+{
+	char buf[256];
+
+	if (cmp_read_file(dir, "memory.events", buf, sizeof(buf)) < 0)
+		return 0;
+
+	return cmp_parse_key(buf, "low");
+}
+
+static unsigned long long cmp_psi_some_us(const char *dir)
+{
+	char buf[512];
+	char *p;
+
+	if (cmp_read_file(dir, "memory.pressure", buf, sizeof(buf)) < 0)
+		return 0;
+	p = strstr(buf, "some ");
+	if (!p)
+		return 0;
+	p = strstr(p, "total=");
+	if (!p)
+		return 0;
+
+	return strtoull(p + 6, NULL, 10);
+}
+
+static unsigned long long cmp_refaults(const char *dir)
+{
+	char buf[8192];
+
+	if (cmp_read_file(dir, "memory.stat", buf, sizeof(buf)) < 0)
+		return 0;
+
+	return cmp_parse_key(buf, "workingset_refault_anon") +
+	       cmp_parse_key(buf, "workingset_refault_file");
+}
+
+/* A's "pgsteal": pages reclaim stole from A - the cmp arms' evidence. The
+ * BPF side sums the same four counters the kernel aggregates into this line.
+ */
+static unsigned long long cmp_steals(const char *dir)
+{
+	char buf[8192];
+
+	if (cmp_read_file(dir, "memory.stat", buf, sizeof(buf)) < 0)
+		return 0;
+
+	return cmp_parse_key(buf, "pgsteal");
+}
+
+static unsigned long long cmp_cpu_usage_us(const char *dir)
+{
+	char buf[256];
+
+	if (cmp_read_file(dir, "cpu.stat", buf, sizeof(buf)) < 0)
+		return 0;
+
+	return cmp_parse_key(buf, "usage_usec");
+}
+
+static int cmp_join(const char *dir)
+{
+	char path[PATH_MAX];
+	int fd, ret = -1;
+
+	snprintf(path, sizeof(path), "%s/cgroup.procs", dir);
+	fd = open(path, O_RDWR);
+	if (fd < 0) {
+		log_err("opening %s", path);
+		return -1;
+	}
+	if (dprintf(fd, "%d", getpid()) > 0)
+		ret = 0;
+	else
+		log_err("joining %s", dir);
+	close(fd);
+
+	return ret;
+}
+
+static int cmp_read_report(int fd, void *out, size_t sz)
+{
+	if (fd < 0 || lseek(fd, 0, SEEK_SET) == (off_t)-1)
+		return -1;
+	if (read(fd, out, sz) != (ssize_t)sz)
+		return -1;
+
+	return 0;
+}
+
+/* Workload children. Each installs its own SIGTERM handler: the parent's
+ * handler is inherited across fork and watches a flag only the parent's
+ * loops read. SIGINT is ignored so that a terminal Ctrl-C reaches the
+ * children only through the parent's orderly kill.
+ */
+
+static int cmp_child_reader(const char *cg_dir, int data_fd, int report_fd,
+			    unsigned long file_size, unsigned long cycle_ms)
+{
+	struct cmp_child_report rep = {};
+
+	signal(SIGINT, SIG_IGN);
+	signal(SIGTERM, cmp_child_handle_term);
+
+	if (cmp_join(cg_dir))
+		return CHILD_EXIT_JOIN_CGROUP;
+	if (write_file(data_fd, file_size))
+		return CHILD_EXIT_WRITE_FILE;
+
+	while (!cmp_child_stop) {
+		__u64 t0 = mono_ns(), d;
+
+		if (read_file(data_fd, file_size, 1))
+			return CHILD_EXIT_READ_FILE;
+		d = mono_ns() - t0;
+		rep.iters++;
+		rep.sum_ns += d;
+		if (d > rep.max_ns)
+			rep.max_ns = d;
+
+		/*
+		 * Pace the passes to one reference per page per cycle. A
+		 * tight loop keeps every page referenced hundreds of times a
+		 * second, wins any LRU competition outright and hides what
+		 * protection buys; a paced reader is the workload the
+		 * comparison is about. Reported latencies exclude the pause.
+		 */
+		if (cycle_ms && d < (__u64)cycle_ms * 1000000ULL)
+			usleep((useconds_t)(((__u64)cycle_ms * 1000000ULL - d)
+					    / 1000));
+	}
+
+	if (write(report_fd, &rep, sizeof(rep)) != (ssize_t)sizeof(rep))
+		return CHILD_EXIT_TIME_FILE;
+
+	return CHILD_EXIT_OK;
+}
+
+static int cmp_child_filler(const char *cg_dir, int data_fd,
+			    unsigned long filler_bytes, unsigned long sleep_ms)
+{
+	signal(SIGINT, SIG_IGN);
+	signal(SIGTERM, cmp_child_handle_term);
+
+	if (cmp_join(cg_dir))
+		return CHILD_EXIT_JOIN_CGROUP;
+
+	/*
+	 * Rewrite the file in a loop. A one-shot filler is a finite stock of
+	 * cold pages: once reclaim has eaten it, the only supply left is A,
+	 * protected or not. A continuous writer is a renewable flow: its own
+	 * tail is always the coldest memory in T, so reclaim keeps a steady
+	 * supply of unprotected victims for the whole window. Staying alive
+	 * also keeps B's css online, so its cache stays reclaimable.
+	 */
+	while (!cmp_child_stop) {
+		if (lseek(data_fd, 0, SEEK_SET) < 0)
+			return CHILD_EXIT_WRITE_FILE;
+		if (write_file(data_fd, filler_bytes))
+			return CHILD_EXIT_WRITE_FILE;
+		if (sleep_ms)
+			usleep((useconds_t)sleep_ms * 1000);
+	}
+
+	return CHILD_EXIT_OK;
+}
+
+static int cmp_child_burst(const char *cg_dir, unsigned long burst_bytes)
+{
+	char *p;
+
+	signal(SIGINT, SIG_IGN);
+	signal(SIGTERM, cmp_child_handle_term);
+
+	if (cmp_join(cg_dir))
+		return CHILD_EXIT_JOIN_CGROUP;
+
+	p = mmap(NULL, burst_bytes, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return CHILD_EXIT_WRITE_FILE;
+	memset(p, 0xa5, burst_bytes);
+
+	while (!cmp_child_stop)
+		pause();
+
+	return CHILD_EXIT_OK;
+}
+
+/* The U arm. Same policy.h arithmetic as the B arms, on the same counter
+ * (A's memory.current - the live page_counter, no stats flush involved),
+ * with the actions a userspace agent has: wake on a PSI trigger or a timer,
+ * pread memory.current, write memory.low. The sample doubles as the action:
+ * while protecting, every tick writes the memory.current it just read to
+ * memory.low, matching the kernel-side REQUEST_USAGE semantics of "protect
+ * my whole usage" re-evaluated on every pass - the snapshot's staleness and
+ * the rewrite's cost are part of what the arm measures.
+ */
+struct cmp_agent_cfg {
+	int use_poll;
+	unsigned long interval_ms;
+	unsigned long psi_us;
+	unsigned long page_size;
+	__u64 rate;
+	__u64 hysteresis_ns;
+};
+
+/* Reads A's memory.current into @buf (kept as bytes text for the memory.low
+ * write) and converts it to pages for the policy. */
+static int cmp_agent_read_usage(int cur_fd, char *buf, size_t len,
+				unsigned long page_size, __u64 *pages)
+{
+	ssize_t n = pread(cur_fd, buf, len - 1, 0);
+
+	if (n <= 0)
+		return -1;
+	buf[n] = '\0';
+	*pages = strtoull(buf, NULL, 10) / page_size;
+
+	return 0;
+}
+
+static int cmp_child_agent(const struct cmp_agent_cfg *ac, int report_fd)
+{
+	struct cmp_agent_report rep = {};
+	struct policy_state st = {};
+	char curbuf[64], trig[64];
+	int cur_fd, low_fd, psi_fd = -1;
+	int last = -1;
+
+	signal(SIGINT, SIG_IGN);
+	signal(SIGTERM, cmp_child_handle_term);
+
+	if (cmp_join(CMP_AGENT_DIR))
+		return CHILD_EXIT_JOIN_CGROUP;
+
+	cur_fd = open(CMP_A_DIR "/memory.current", O_RDONLY);
+	low_fd = open(CMP_A_DIR "/memory.low", O_RDWR);
+	if (cur_fd < 0 || low_fd < 0)
+		return CHILD_EXIT_OPEN_FILES;
+
+	if (ac->use_poll) {
+		psi_fd = open(CMP_A_DIR "/memory.pressure", O_RDWR);
+		if (psi_fd < 0)
+			return CHILD_EXIT_PSI_OPEN;
+		snprintf(trig, sizeof(trig), "some %lu %d", ac->psi_us,
+			 CMP_PSI_WINDOW_US);
+		if (write(psi_fd, trig, strlen(trig)) < 0)
+			return CHILD_EXIT_PSI_TRIGGER;
+	}
+
+	/* A failed seed leaves prev_level at 0, which the fall-based policy
+	 * turns into "first sample carries no evidence", never a false one.
+	 */
+	cmp_agent_read_usage(cur_fd, curbuf, sizeof(curbuf), ac->page_size,
+			     &st.prev_level);
+	st.prev_ns = mono_ns();
+
+	while (!cmp_child_stop) {
+		__u64 t0, t1, level;
+		int protect;
+
+		if (ac->use_poll) {
+			struct pollfd pfd = {
+				.fd	= psi_fd,
+				.events	= POLLPRI | POLLERR,
+			};
+			int n = poll(&pfd, 1, -1);
+
+			/* EINTR means SIGTERM set the stop flag. */
+			if (n <= 0)
+				break;
+			/* PSI triggers are one-shot; re-arm before sampling. */
+			if (pwrite(psi_fd, trig, strlen(trig), 0) < 0)
+				break;
+		} else {
+			struct timespec ts = {
+				.tv_sec		= (time_t)(ac->interval_ms / 1000),
+				.tv_nsec	= (long)(ac->interval_ms % 1000) * 1000000L,
+			};
+
+			clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+		}
+		if (cmp_child_stop)
+			break;
+
+		t0 = mono_ns();
+		if (cmp_agent_read_usage(cur_fd, curbuf, sizeof(curbuf),
+					 ac->page_size, &level))
+			break;
+		protect = policy_protect(&st, level, t0, ac->rate,
+					 ac->hysteresis_ns);
+		if (protect) {
+			/*
+			 * The sample doubles as the protection snapshot: the
+			 * kernel-side REQUEST_USAGE re-reads usage on every
+			 * pass, so a write-once memory.low would freeze the
+			 * protection at whatever A held when it first
+			 * triggered and cap A below its real working set.
+			 */
+			if (pwrite(low_fd, curbuf, strlen(curbuf), 0) < 0)
+				break;
+			rep.writes++;
+			t1 = mono_ns();
+			if (!rep.first_protect_ns)
+				rep.first_protect_ns = t1;
+		} else {
+			if (last == 1 && pwrite(low_fd, "0", 1, 0) < 0)
+				break;
+			if (last == 1)
+				rep.writes++;
+			t1 = mono_ns();
+		}
+		last = protect;
+		rep.decisions++;
+		rep.sample_sum_ns += t1 - t0;
+		if (t1 - t0 > rep.sample_max_ns)
+			rep.sample_max_ns = t1 - t0;
+	}
+
+	/* Never leave protection behind for the next arm's round. */
+	if (pwrite(low_fd, "0", 1, 0) < 0)
+		fprintf(stderr, "WARNING: agent failed to reset memory.low\n");
+	if (write(report_fd, &rep, sizeof(rep)) != (ssize_t)sizeof(rep))
+		fprintf(stderr, "WARNING: agent failed to write its report\n");
+
+	return CHILD_EXIT_OK;
+}
+
+/* Topology setup and teardown */
+
+static int cmp_setup_topology(const struct options *o)
+{
+	static const char * const dirs[] = {
+		CMP_A_DIR, CMP_B_DIR, CMP_C_DIR, CMP_AGENT_DIR
+	};
+	char buf[64];
+	int i;
+
+	if (setup_cgroup_environment())
+		return -1;
+
+	if (mkdir(CMP_T_DIR, 0777) && errno != EEXIST) {
+		log_err("mkdir %s", CMP_T_DIR);
+		return -1;
+	}
+	if (cmp_write_ull(CMP_T_DIR, "memory.max", o->tmax) ||
+	    cmp_write_ull(CMP_T_DIR, "memory.low", o->budget))
+		return -1;
+	/*
+	 * Swap off keeps C's anon unreclaimable, so sustained pressure has
+	 * to come out of file cache and protection has a visible effect.
+	 * Best effort: the file only exists with CONFIG_SWAP.
+	 */
+	if (!access("/proc/swaps", F_OK))
+		cmp_write_str(CMP_T_DIR, "memory.swap.max", "0");
+
+	/* Before the children exist: an internal process would make the
+	 * subtree_control write fail.
+	 */
+	if (cmp_write_str(CMP_T_DIR, "cgroup.subtree_control", "+memory"))
+		return -1;
+
+	for (i = 0; i < (int)ARRAY_SIZE(dirs); i++)
+		if (mkdir(dirs[i], 0777) && errno != EEXIST) {
+			log_err("mkdir %s", dirs[i]);
+			return -1;
+		}
+
+	if (o->agent_min &&
+	    cmp_write_ull(CMP_AGENT_DIR, "memory.min", o->agent_min))
+		return -1;
+
+	if (cmp_read_file(CMP_T_DIR, "memory.current", buf, sizeof(buf)) < 0) {
+		fprintf(stderr, "ERROR: %s has no memory.current; the memory controller\n"
+			"       is not enabled at the root of the cgroup2 hierarchy.\n",
+			CMP_T_DIR);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int cmp_rmdir_abs(const char *path)
+{
+	if (!rmdir(path) || errno == ENOENT)
+		return 0;
+
+	return -1;
+}
+
+static void cmp_teardown_cgroups(void)
+{
+	int i;
+
+	/*
+	 * The children's css pins their cgroups until their page cache is
+	 * gone; dropping caches after the reaps makes the rmdirs succeed
+	 * within a few retries. Best effort: the mount view dies with the
+	 * process, but the cgroups belong to the real hierarchy.
+	 */
+	cmp_write_str("/proc/sys/vm", "drop_caches", "3");
+
+	for (i = 0; i < 20; i++) {
+		int ok = !cmp_rmdir_abs(CMP_A_DIR);
+
+		ok &= !cmp_rmdir_abs(CMP_B_DIR);
+		ok &= !cmp_rmdir_abs(CMP_C_DIR);
+		ok &= !cmp_rmdir_abs(CMP_AGENT_DIR);
+		if (ok && !cmp_rmdir_abs(CMP_T_DIR))
+			break;
+		usleep(100000);
+	}
+
+	cleanup_cgroup_environment();
+}
+
+/* Measurement helpers */
+
+static void cmp_take_snapshot(struct cmp_snapshot *s)
+{
+	memset(s, 0, sizeof(*s));
+
+	s->steal_a = cmp_steals(CMP_A_DIR);
+	s->refault_a = cmp_refaults(CMP_A_DIR);
+	s->low_events_a = cmp_events_low(CMP_A_DIR);
+	s->psi_a_us = cmp_psi_some_us(CMP_A_DIR);
+	s->psi_b_us = cmp_psi_some_us(CMP_B_DIR);
+	s->cur_a = cmp_read_ull(CMP_A_DIR, "memory.current");
+	s->cur_b = cmp_read_ull(CMP_B_DIR, "memory.current");
+	s->cur_c = cmp_read_ull(CMP_C_DIR, "memory.current");
+	s->cur_t = cmp_read_ull(CMP_T_DIR, "memory.current");
+	s->cpu_a_us = cmp_cpu_usage_us(CMP_A_DIR);
+	s->cpu_b_us = cmp_cpu_usage_us(CMP_B_DIR);
+	s->cpu_c_us = cmp_cpu_usage_us(CMP_C_DIR);
+	s->cpu_agent_us = cmp_cpu_usage_us(CMP_AGENT_DIR);
+}
+
+static int cmp_prog_run_info(struct bpf_program *prog, __u64 *run_time_ns,
+			     __u64 *run_cnt)
+{
+	struct bpf_prog_info info = {};
+	__u32 len = sizeof(info);
+	int fd;
+
+	*run_time_ns = 0;
+	*run_cnt = 0;
+
+	fd = bpf_program__fd(prog);
+	if (fd < 0 || bpf_obj_get_info_by_fd(fd, &info, &len))
+		return -1;
+
+	*run_time_ns = info.run_time_ns;
+	*run_cnt = info.run_cnt;
+
+	return 0;
+}
+
+static void cmp_set_bpf_stats(int on, int *prev)
+{
+	char buf[16];
+
+	if (prev) {
+		*prev = -1;
+		if (cmp_read_file("/proc/sys/kernel", "bpf_stats_enabled",
+				  buf, sizeof(buf)) >= 0)
+			*prev = atoi(buf);
+	}
+	if (cmp_write_str("/proc/sys/kernel", "bpf_stats_enabled",
+			  on ? "1" : "0"))
+		fprintf(stderr, "WARNING: cannot set kernel.bpf_stats_enabled;"
+			" BPF run_time stays 0\n");
+}
+
+static int cmp_parse_impl(const char *s, enum cmp_impl *out)
+{
+	if (!strcmp(s, "user"))
+		*out = CMP_IMPL_USER;
+	else if (!strcmp(s, "bpf-poll"))
+		*out = CMP_IMPL_BPF_POLL;
+	else if (!strcmp(s, "bpf-hook"))
+		*out = CMP_IMPL_BPF_HOOK;
+	else if (!strcmp(s, "sanity"))
+		*out = CMP_IMPL_SANITY;
+	else
+		return -1;
+
+	return 0;
+}
+
+static int cmp_parse_trigger(const char *s, enum cmp_trigger *out)
+{
+	if (!strcmp(s, "timer"))
+		*out = CMP_TRIG_TIMER;
+	else if (!strcmp(s, "poll"))
+		*out = CMP_TRIG_POLL;
+	else
+		return -1;
+
+	return 0;
+}
+
+static const char *cmp_trigger_str(enum cmp_trigger t)
+{
+	return t == CMP_TRIG_POLL ? "poll" : "timer";
+}
+
+static int do_cmp(struct options *o)
+{
+	char a_data[PATH_MAX], b_data[PATH_MAX], a_rep[PATH_MAX], g_rep[PATH_MAX];
+	int a_data_fd = -1, b_data_fd = -1, a_rep_fd = -1, g_rep_fd = -1;
+	int a_dir_fd = -1, init_fd, stats_prev = -1, ret = 1, valid;
+	pid_t a_pid = -1, b_pid = -1, c_pid = -1, agent_pid = -1;
+	struct cmp_child_report arep = {};
+	struct cmp_agent_report greport = {};
+	struct cmp_snapshot pre = {}, post = {};
+	struct memcg_async_reclaim *skel = NULL;
+	struct bpf_program *member_prog = NULL;
+	struct bpf_link *link = NULL;
+	enum cmp_trigger trigger = CMP_TRIG_TIMER;
+	enum cmp_impl impl;
+	__u64 a_id = 0, t_burst = 0, first_protect_ns;
+	__u64 rt_pre = 0, rc_pre = 0, rt_post = 0, rc_post = 0;
+	__u64 hook_calls = 0, hook_pre = 0, requests = 0, poll_ticks = 0;
+	__u64 acquire_fails = 0, timer_failures = 0;
+
+	LIBBPF_OPTS(bpf_test_run_opts, run_opts);
+	const char *dir;
+	double deadline;
+	char fmtb[32];
+
+	if (!o->impl_str || cmp_parse_impl(o->impl_str, &impl)) {
+		fprintf(stderr, "ERROR: cmp needs --impl user|bpf-poll|bpf-hook|sanity\n");
+		return 1;
+	}
+	if (o->trigger_str && cmp_parse_trigger(o->trigger_str, &trigger)) {
+		fprintf(stderr, "ERROR: --trigger must be timer or poll\n");
+		return 1;
+	}
+
+	signal(SIGINT, handle_signal);
+	signal(SIGTERM, handle_signal);
+
+	printf("cmp: impl=%s trigger=%s interval=%lums rate=%lu/s hysteresis=%lums read-cycle=%lums filler-sleep=%lums\n",
+	       o->impl_str, cmp_trigger_str(trigger), o->interval_ms,
+	       o->threshold, o->hysteresis_ms, o->read_cycle_ms,
+	       o->filler_sleep_ms);
+	fmt_bytes(fmtb, sizeof(fmtb), o->tmax);
+	printf("     tmax=%s", fmtb);
+	fmt_bytes(fmtb, sizeof(fmtb), o->budget);
+	printf(" budget=%s", fmtb);
+	fmt_bytes(fmtb, sizeof(fmtb), o->filler_bytes);
+	printf(" filler=%s", fmtb);
+	fmt_bytes(fmtb, sizeof(fmtb), o->burst_bytes);
+	printf(" burst=%s", fmtb);
+	fmt_bytes(fmtb, sizeof(fmtb), o->file_size);
+	printf(" a-file=%s", fmtb);
+	fmt_bytes(fmtb, sizeof(fmtb), o->agent_min);
+	printf(" agent-min=%s\n", fmtb);
+	printf("     ramp=%lus duration=%lus\n", o->ramp_sec, o->duration_sec);
+	if (!o->burst_bytes)
+		fprintf(stderr, "WARNING: --burst 0: no anon ballast; T's file pool\n"
+			"         grows and A takes a smaller share of the scan.\n");
+
+	if (cmp_setup_topology(o))
+		goto out;
+
+	a_id = cgroup_id_from_path(CMP_A_DIR);
+	if (!a_id) {
+		fprintf(stderr, "ERROR: cannot resolve %s: %s\n", CMP_A_DIR,
+			strerror(errno));
+		goto out;
+	}
+
+	/*
+	 * Without psi=1 (CONFIG_PSI_DEFAULT_DISABLED=y kernels) memory.pressure
+	 * does not exist: the poll agent could never arm, and every PSI column
+	 * would silently read 0 - which once masqueraded as "A never stalls".
+	 */
+	if (access(CMP_A_DIR "/memory.pressure", R_OK | W_OK)) {
+		if (trigger == CMP_TRIG_POLL) {
+			fprintf(stderr, "ERROR: %s/memory.pressure unavailable (%s):\n"
+				"       --trigger poll needs PSI; boot with psi=1\n",
+				CMP_A_DIR, strerror(errno));
+			goto out;
+		}
+		fprintf(stderr, "WARNING: memory.pressure unavailable (%s) - PSI\n"
+			"         columns read 0; boot with psi=1 to fill them.\n",
+			strerror(errno));
+	}
+
+	if (impl != CMP_IMPL_USER) {
+		struct cmp_cfg cfg = {
+			.enabled		= 1,
+			.monitor_cgroup_id	= a_id,
+			.interval_ns		= impl == CMP_IMPL_BPF_POLL ?
+				(__u64)o->interval_ms * 1000000ULL : 0,
+			.drop_rate		= o->threshold,
+			.hysteresis_ns		= (__u64)o->hysteresis_ms * 1000000ULL,
+			.page_size		= (__u64)sysconf(_SC_PAGESIZE),
+		};
+		__u32 zero = 0;
+
+		skel = memcg_async_reclaim__open_and_load();
+		if (!skel) {
+			fprintf(stderr, "ERROR: failed to open or load the BPF object\n");
+			goto out;
+		}
+
+		if (bpf_map_update_elem(bpf_map__fd(skel->maps.cmp_cfg),
+					&zero, &cfg, 0)) {
+			fprintf(stderr, "ERROR: cmp_cfg update: %s\n",
+				strerror(errno));
+			goto out;
+		}
+
+		a_dir_fd = open(CMP_A_DIR, O_RDONLY);
+		if (a_dir_fd < 0) {
+			log_err("opening %s", CMP_A_DIR);
+			goto out;
+		}
+
+		switch (impl) {
+		case CMP_IMPL_BPF_POLL:
+			link = bpf_map__attach_cgroup_opts(
+				skel->maps.cmp_prot_ops_poll, a_dir_fd, NULL);
+			member_prog = skel->progs.cmp_low_request_poll;
+			break;
+		case CMP_IMPL_BPF_HOOK:
+			link = bpf_map__attach_cgroup_opts(
+				skel->maps.cmp_prot_ops_hook, a_dir_fd, NULL);
+			member_prog = skel->progs.cmp_low_request_hook;
+			break;
+		case CMP_IMPL_SANITY:
+			link = bpf_map__attach_cgroup_opts(
+				skel->maps.cmp_prot_ops_sanity, a_dir_fd, NULL);
+			member_prog = skel->progs.cmp_low_request_sanity;
+			break;
+		default:
+			break;
+		}
+		if (!link) {
+			fprintf(stderr, "ERROR: attach to %s failed: %s\n",
+				CMP_A_DIR, strerror(errno));
+			goto out;
+		}
+
+		/* Seeds the B-arm baselines; starts the B1 timer. */
+		init_fd = bpf_program__fd(skel->progs.cmp_prot_init);
+		if (bpf_prog_test_run_opts(init_fd, &run_opts) ||
+		    run_opts.retval) {
+			fprintf(stderr, "ERROR: cmp_prot_init failed: %s (retval %d)\n",
+				errno ? strerror(errno) : "-",
+				run_opts.retval);
+			goto out;
+		}
+	}
+
+	dir = workload_files_dir();
+	if (!dir) {
+		fprintf(stderr, "ERROR: no writable non-tmpfs directory for the workload files\n");
+		goto out;
+	}
+	snprintf(a_data, sizeof(a_data), "%s/cmp_a_data_XXXXXX", dir);
+	snprintf(b_data, sizeof(b_data), "%s/cmp_b_data_XXXXXX", dir);
+	snprintf(a_rep, sizeof(a_rep), "%s/cmp_a_rep_XXXXXX", dir);
+	snprintf(g_rep, sizeof(g_rep), "%s/cmp_g_rep_XXXXXX", dir);
+	a_data_fd = mkstemp(a_data);
+	b_data_fd = mkstemp(b_data);
+	a_rep_fd = mkstemp(a_rep);
+	g_rep_fd = mkstemp(g_rep);
+	if (a_data_fd < 0 || b_data_fd < 0 || a_rep_fd < 0 || g_rep_fd < 0) {
+		fprintf(stderr, "ERROR: mkstemp: %s\n", strerror(errno));
+		goto out;
+	}
+
+	b_pid = fork();
+	if (b_pid == 0)
+		_exit(cmp_child_filler(CMP_B_DIR, b_data_fd, o->filler_bytes,
+				       o->filler_sleep_ms));
+	if (b_pid < 0) {
+		fprintf(stderr, "ERROR: fork filler: %s\n", strerror(errno));
+		goto out;
+	}
+
+	a_pid = fork();
+	if (a_pid == 0)
+		_exit(cmp_child_reader(CMP_A_DIR, a_data_fd, a_rep_fd,
+				       o->file_size, o->read_cycle_ms));
+	if (a_pid < 0) {
+		fprintf(stderr, "ERROR: fork reader: %s\n", strerror(errno));
+		goto out;
+	}
+
+	if (impl == CMP_IMPL_USER) {
+		struct cmp_agent_cfg ac = {
+			.use_poll	= trigger == CMP_TRIG_POLL,
+			.interval_ms	= o->interval_ms,
+			.psi_us		= o->psi_us,
+			.page_size	= (unsigned long)sysconf(_SC_PAGESIZE),
+			.rate		= o->threshold,
+			.hysteresis_ns	= (__u64)o->hysteresis_ms * 1000000ULL,
+		};
+
+		agent_pid = fork();
+		if (agent_pid == 0)
+			_exit(cmp_child_agent(&ac, g_rep_fd));
+		if (agent_pid < 0) {
+			fprintf(stderr, "ERROR: fork agent: %s\n",
+				strerror(errno));
+			goto out;
+		}
+	}
+
+	/* Ramp: let B's cache build and A settle into its read loop before
+	 * anything is measured or protected.
+	 */
+	deadline = now_sec() + o->ramp_sec;
+	while (!READ_ONCE(exiting) && now_sec() < deadline)
+		usleep(POLL_SLICE_MS * 1000);
+
+	if (impl != CMP_IMPL_USER) {
+		cmp_set_bpf_stats(1, &stats_prev);
+		if (member_prog)
+			cmp_prog_run_info(member_prog, &rt_pre, &rc_pre);
+	}
+	cmp_take_snapshot(&pre);
+	if (skel)
+		hook_pre = skel->bss->cmp_hook_calls;
+
+	t_burst = mono_ns();
+	if (o->burst_bytes) {
+		c_pid = fork();
+		if (c_pid == 0)
+			_exit(cmp_child_burst(CMP_C_DIR, o->burst_bytes));
+		if (c_pid < 0) {
+			fprintf(stderr, "ERROR: fork burst: %s\n",
+				strerror(errno));
+			goto stop;
+		}
+	}
+
+	deadline = now_sec() + o->duration_sec;
+	while (!READ_ONCE(exiting) && now_sec() < deadline)
+		usleep(POLL_SLICE_MS * 1000);
+
+stop:
+	cmp_take_snapshot(&post);
+	if (member_prog)
+		cmp_prog_run_info(member_prog, &rt_post, &rc_post);
+
+	if (agent_pid > 0)
+		kill(agent_pid, SIGTERM);
+	if (c_pid > 0)
+		kill(c_pid, SIGTERM);
+	if (a_pid > 0)
+		kill(a_pid, SIGTERM);
+	if (b_pid > 0)
+		kill(b_pid, SIGTERM);
+	if (agent_pid > 0)
+		reap_child(&agent_pid, "agent");
+	if (c_pid > 0)
+		reap_child(&c_pid, "burst");
+	if (a_pid > 0)
+		reap_child(&a_pid, "reader");
+	if (b_pid > 0)
+		reap_child(&b_pid, "filler");
+
+	if (cmp_read_report(a_rep_fd, &arep, sizeof(arep)))
+		fprintf(stderr, "WARNING: no reader report\n");
+	if (impl == CMP_IMPL_USER &&
+	    cmp_read_report(g_rep_fd, &greport, sizeof(greport)))
+		fprintf(stderr, "WARNING: no agent report\n");
+
+	if (skel) {
+		hook_calls = skel->bss->cmp_hook_calls;
+		requests = skel->bss->cmp_requests;
+		poll_ticks = skel->bss->cmp_poll_ticks;
+		acquire_fails = skel->bss->cmp_acquire_fails;
+		timer_failures = skel->bss->cmp_timer_failures;
+		first_protect_ns = skel->bss->cmp_first_request_ns;
+	} else {
+		first_protect_ns = greport.first_protect_ns;
+	}
+
+	/*
+	 * A round in which protection never engaged measures nothing: the
+	 * arms would be identical by construction. Flag it instead of
+	 * letting it into the statistics.
+	 *
+	 * Sanity additionally requires the hook to have been called inside
+	 * the window (the burst did drive reclaim through A's protection
+	 * calculation) and A to have kept essentially all of its pages. Not
+	 * exactly all: during C's charge storm a reclaim pass occasionally
+	 * cannot be satisfied from B's young tail and dips through the
+	 * protection (MEMCG_LOW overrides), which leaks a few pages under
+	 * any protection shape - unconditional requests included. Allow up
+	 * to 1/8 of A's file: a broken chain loses the whole working set
+	 * (thousands of pages per read pass), so the gate still separates
+	 * cleanly. A's memory.events "low" is NOT the gate: the kernel only
+	 * counts MEMCG_LOW when reclaim overrides the protection on a
+	 * second pass, so it stays 0 for as long as B supplies enough
+	 * unprotected memory - which is the protection working, not failing.
+	 */
+	valid = first_protect_ns != 0;
+	if (impl == CMP_IMPL_SANITY)
+		valid = valid && hook_calls > hook_pre &&
+			post.steal_a - pre.steal_a <=
+				o->file_size / 4096 / 8;
+
+	printf("\n--- result (window = %.1fs burst phase) ---\n",
+	       (double)(mono_ns() - t_burst) / 1e9);
+	printf("A: pgsteal +%llu pages, refault +%llu KiB, low overrides +%llu, PSI some +%llu us, current %llu KiB\n",
+	       post.steal_a - pre.steal_a,
+	       (post.refault_a - pre.refault_a) / 1024,
+	       post.low_events_a - pre.low_events_a,
+	       post.psi_a_us - pre.psi_a_us, post.cur_a / 1024);
+	printf("A: reads %llu, avg %llu us, max %llu us\n",
+	       (unsigned long long)arep.iters,
+	       arep.iters ? (unsigned long long)(arep.sum_ns / arep.iters / 1000) : 0ULL,
+	       (unsigned long long)(arep.max_ns / 1000));
+	printf("B: PSI some +%llu us, current %llu KiB\n",
+	       post.psi_b_us - pre.psi_b_us, post.cur_b / 1024);
+	if (first_protect_ns)
+		printf("first protection: %+.1f ms from burst start%s\n",
+		       ((double)first_protect_ns - (double)t_burst) / 1e6,
+		       valid ? "" : " - ROUND VOID (see sanity line)");
+	else
+		printf("first protection: never - ROUND VOID (trigger not reached)\n");
+
+	if (impl == CMP_IMPL_USER) {
+		printf("agent: decisions %llu, low writes %llu, sample avg %llu us max %llu us\n",
+		       (unsigned long long)greport.decisions,
+		       (unsigned long long)greport.writes,
+		       greport.decisions ? (unsigned long long)(greport.sample_sum_ns / greport.decisions / 1000) : 0ULL,
+		       (unsigned long long)(greport.sample_max_ns / 1000));
+		printf("agent cpu: %llu us (agent cgroup), A cpu %llu us, B cpu %llu us, C cpu %llu us\n",
+		       post.cpu_agent_us - pre.cpu_agent_us,
+		       post.cpu_a_us - pre.cpu_a_us,
+		       post.cpu_b_us - pre.cpu_b_us,
+		       post.cpu_c_us - pre.cpu_c_us);
+	} else {
+		printf("bpf: hook calls %llu, requests %llu, poll ticks %llu, acquire fails %llu, timer fails %llu\n",
+		       (unsigned long long)hook_calls,
+		       (unsigned long long)requests,
+		       (unsigned long long)poll_ticks,
+		       (unsigned long long)acquire_fails,
+		       (unsigned long long)timer_failures);
+		if (rc_post > rc_pre)
+			printf("bpf: hook run_time %llu ns over %llu runs (avg %llu ns)\n",
+			       (unsigned long long)(rt_post - rt_pre),
+			       (unsigned long long)(rc_post - rc_pre),
+			       (unsigned long long)((rt_post - rt_pre) / (rc_post - rc_pre)));
+		else
+			printf("bpf: hook run_time unavailable (kernel.bpf_stats_enabled?)\n");
+		printf("cpu: A %llu us, B %llu us, C %llu us\n",
+		       post.cpu_a_us - pre.cpu_a_us,
+		       post.cpu_b_us - pre.cpu_b_us,
+		       post.cpu_c_us - pre.cpu_c_us);
+	}
+	if (impl == CMP_IMPL_SANITY)
+		printf("sanity: %s (hook calls %llu in window, A pgsteal +%llu pages, tol %llu, refault +%llu KiB, low overrides +%llu)\n",
+		       valid ? "PASS" : "FAIL",
+		       (unsigned long long)(hook_calls - hook_pre),
+		       (unsigned long long)(post.steal_a - pre.steal_a),
+		       (unsigned long long)(o->file_size / 4096 / 8),
+		       (unsigned long long)((post.refault_a - pre.refault_a) / 1024),
+		       (unsigned long long)(post.low_events_a - pre.low_events_a));
+	if (acquire_fails)
+		fprintf(stderr, "WARNING: %llu acquire-route failures in the B1 sampler\n",
+			(unsigned long long)acquire_fails);
+	if (timer_failures)
+		fprintf(stderr, "WARNING: B1 timer rearm failed %llu time(s)\n",
+			(unsigned long long)timer_failures);
+
+	if (o->csv_path) {
+		FILE *f = fopen(o->csv_path, "a");
+
+		if (!f) {
+			fprintf(stderr, "WARNING: cannot append to %s: %s\n",
+				o->csv_path, strerror(errno));
+		} else {
+			if (!ftell(f))
+				fprintf(f, "ts,impl,trigger,interval_ms,psi_us,rate_pps,read_cycle_ms,filler_sleep_ms,hysteresis_ms,duration_sec,burst,budget,tmax,steal_a_pages,refault_a_kib,low_a,psi_a_us,psi_b_us,cur_a_kib,first_protect_ms,decisions,writes,hook_calls,requests,poll_ticks,acquire_fails,run_time_ns,run_cnt,a_iters,a_avg_us,a_max_us,agent_avg_us,agent_max_us,cpu_a_us,cpu_b_us,cpu_c_us,cpu_agent_us,valid\n");
+			fprintf(f, "%lld,%s,%s,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%llu,%llu,%llu,%llu,%llu,%llu,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d\n",
+				(long long)time(NULL), o->impl_str,
+				cmp_trigger_str(trigger), o->interval_ms,
+				o->psi_us, o->threshold, o->read_cycle_ms,
+				o->filler_sleep_ms, o->hysteresis_ms,
+				o->duration_sec,
+				o->burst_bytes, o->budget, o->tmax,
+				post.steal_a - pre.steal_a,
+				(post.refault_a - pre.refault_a) / 1024,
+				post.low_events_a - pre.low_events_a,
+				post.psi_a_us - pre.psi_a_us,
+				post.psi_b_us - pre.psi_b_us,
+				post.cur_a / 1024,
+				valid ? ((double)first_protect_ns - (double)t_burst) / 1e6 : -1.0,
+				greport.decisions, greport.writes,
+				hook_calls, requests, poll_ticks,
+				acquire_fails, rt_post - rt_pre,
+				rc_post - rc_pre, arep.iters,
+				arep.iters ? arep.sum_ns / arep.iters / 1000 : 0,
+				arep.max_ns / 1000,
+				greport.decisions ? greport.sample_sum_ns / greport.decisions / 1000 : 0,
+				greport.sample_max_ns / 1000,
+				post.cpu_a_us - pre.cpu_a_us,
+				post.cpu_b_us - pre.cpu_b_us,
+				post.cpu_c_us - pre.cpu_c_us,
+				post.cpu_agent_us - pre.cpu_agent_us,
+				valid);
+			fclose(f);
+		}
+	}
+
+	ret = 0;
+
+out:
+	if (link)
+		bpf_link__destroy(link);
+	if (skel)
+		memcg_async_reclaim__destroy(skel);
+	if (stats_prev >= 0)
+		cmp_set_bpf_stats(stats_prev, NULL);
+	if (a_dir_fd >= 0)
+		close(a_dir_fd);
+	if (a_data_fd >= 0) {
+		close(a_data_fd);
+		unlink(a_data);
+	}
+	if (b_data_fd >= 0) {
+		close(b_data_fd);
+		unlink(b_data);
+	}
+	if (a_rep_fd >= 0) {
+		close(a_rep_fd);
+		unlink(a_rep);
+	}
+	if (g_rep_fd >= 0) {
+		close(g_rep_fd);
+		unlink(g_rep);
+	}
+	cmp_teardown_cgroups();
+
+	return ret;
+}
+
 /* cli code */
 
 static void usage(const char *prog)
@@ -955,10 +2149,15 @@ static void usage(const char *prog)
 	       "           pressured workload in both, and report the effect of\n"
 	       "           asynchronous reclaim on the pressured one\n"
 	       "  watch    watch an existing cgroup and reclaim from another one\n"
-	       "           whenever it comes under pressure, until interrupted\n\n"
+	       "           whenever it comes under pressure, until interrupted\n"
+	       "  cmp      run one arm of the three-arm memory.low request\n"
+	       "           comparison - userspace agent (user), bpf_wq poller\n"
+	       "           (bpf-poll), in-hook decision (bpf-hook) - against a\n"
+	       "           freshly built topology, and report the burst window\n\n"
 	       "Common options:\n"
-	       "  -i, --interval MS     monitor tick (bench: %d, watch: %d)\n"
+	       "  -i, --interval MS     monitor tick (bench: %d, watch: %d, cmp: %d)\n"
 	       "  -t, --threshold N     refault delta per tick that starts a round (%d)\n"
+	       "                        cmp: A usage-drop pages per second, all arms (%lu)\n"
 	       "  -b, --batch BYTES     bytes requested per callback (%luK)\n"
 	       "  -n, --max-batches N   callbacks per reclaim round (%d)\n"
 	       "  -S, --swappiness N    -1 = the memcg's own, 0..200, 201 = anon\n"
@@ -975,19 +2174,59 @@ static void usage(const char *prog)
 	       "  -T, --target PATH     cgroup to reclaim from (required)\n"
 	       "  -D, --duration SEC    stop after SEC seconds instead of on signal\n"
 	       "  -s, --stats SEC       print a statistics line every SEC seconds (%d)\n\n"
-	       "BYTES accepts a K, M or G suffix. Both modes need root.\n\n"
+	       "cmp options:\n"
+	       "      --impl IMPL       user | bpf-poll | bpf-hook | sanity (required)\n"
+	       "      --trigger T       U arm wakeup: timer (default) or poll (PSI;\n"
+	       "                        needs the kernel booted with psi=1)\n"
+	       "      --psi-us N        poll trigger: stall us per 1s window (%d)\n"
+	       "      --hysteresis MS   hold protection this long after the evidence\n"
+	       "                        stops (%d)\n"
+	       "      --read-cycle MS   A paces its re-read passes to this cycle (%d)\n"
+	       "      --filler-sleep MS B pauses this long between rewrite passes (%d)\n"
+	       "      --budget BYTES    T memory.low, shields the subtree against\n"
+	       "                        global reclaim (%luM)\n"
+	       "      --tmax BYTES      T memory.max, the pressure source (%luM)\n"
+	       "      --filler BYTES    B's file, rewritten in a loop: the renewable\n"
+	       "                        unprotected reclaim fodder (%luM)\n"
+	       "      --burst BYTES     C's one-shot anon ballast; 0 runs without (0)\n"
+	       "      --ramp SEC        settle time before the measured window (%d)\n"
+	       "      --agent-min BYTES agent cgroup memory.min, disclosed (%luM)\n"
+	       "      --csv FILE        append one result row per run\n"
+	       "  -f, -D and -v are shared: A's file size, window length, chatter\n\n"
+	       "BYTES accepts a K, M or G suffix. All modes need root.\n\n"
 	       "One call to bpf_proactive_reclaim() reclaims at most the kernel's\n"
 	       "MEMCG_CHARGE_BATCH pages, so --batch above that limit only means a\n"
 	       "round needs more callbacks, not that a single callback does more.\n",
-	       prog, BENCH_INTERVAL_MS, WATCH_INTERVAL_MS, DEFAULT_THRESHOLD,
+	       prog, BENCH_INTERVAL_MS, WATCH_INTERVAL_MS,
+	       DEFAULT_CMP_INTERVAL_MS, DEFAULT_THRESHOLD,
+	       DEFAULT_CMP_RATE,
 	       DEFAULT_BATCH_BYTES / 1024, DEFAULT_MAX_BATCHES,
 	       DEFAULT_SWAPPINESS, DEFAULT_CG_LIMIT / (1024 * 1024),
 	       DEFAULT_FILE_SIZE / (1024 * 1024), DEFAULT_READ_TIMES,
-	       DEFAULT_STATS_SEC);
+	       DEFAULT_STATS_SEC, DEFAULT_CMP_PSI_US,
+	       DEFAULT_CMP_HYSTERESIS_MS, DEFAULT_CMP_READ_CYCLE_MS,
+	       DEFAULT_CMP_FILLER_SLEEP_MS,
+	       DEFAULT_CMP_BUDGET / (1024 * 1024),
+	       DEFAULT_CMP_TMAX / (1024 * 1024),
+	       DEFAULT_CMP_FILLER / (1024 * 1024), DEFAULT_CMP_RAMP_SEC,
+	       DEFAULT_CMP_AGENT_MIN / (1024 * 1024));
 }
 
 enum {
 	OPT_NO_BASELINE = 256,
+	OPT_IMPL,
+	OPT_TRIGGER,
+	OPT_CSV,
+	OPT_PSI_US,
+	OPT_HYSTERESIS,
+	OPT_READ_CYCLE,
+	OPT_FILLER_SLEEP,
+	OPT_BUDGET,
+	OPT_TMAX,
+	OPT_FILLER,
+	OPT_BURST,
+	OPT_RAMP,
+	OPT_AGENT_MIN,
 };
 
 static int parse_options(int argc, char **argv, struct options *o)
@@ -1008,6 +2247,19 @@ static int parse_options(int argc, char **argv, struct options *o)
 		{ "target",	required_argument,	NULL, 'T' },
 		{ "duration",	required_argument,	NULL, 'D' },
 		{ "stats",	required_argument,	NULL, 's' },
+		{ "impl",	required_argument,	NULL, OPT_IMPL },
+		{ "trigger",	required_argument,	NULL, OPT_TRIGGER },
+		{ "csv",		required_argument,	NULL, OPT_CSV },
+		{ "psi-us",	required_argument,	NULL, OPT_PSI_US },
+		{ "hysteresis",	required_argument,	NULL, OPT_HYSTERESIS },
+		{ "read-cycle",	required_argument,	NULL, OPT_READ_CYCLE },
+		{ "filler-sleep", required_argument,	NULL, OPT_FILLER_SLEEP },
+		{ "budget",	required_argument,	NULL, OPT_BUDGET },
+		{ "tmax",	required_argument,	NULL, OPT_TMAX },
+		{ "filler",	required_argument,	NULL, OPT_FILLER },
+		{ "burst",	required_argument,	NULL, OPT_BURST },
+		{ "ramp",	required_argument,	NULL, OPT_RAMP },
+		{ "agent-min",	required_argument,	NULL, OPT_AGENT_MIN },
 		{ }
 	};
 	int c;
@@ -1067,6 +2319,55 @@ static int parse_options(int argc, char **argv, struct options *o)
 			if (parse_ulong(optarg, &o->stats_sec))
 				return -1;
 			break;
+		case OPT_IMPL:
+			o->impl_str = optarg;
+			break;
+		case OPT_TRIGGER:
+			o->trigger_str = optarg;
+			break;
+		case OPT_CSV:
+			o->csv_path = optarg;
+			break;
+		case OPT_PSI_US:
+			if (parse_ulong(optarg, &o->psi_us))
+				return -1;
+			break;
+		case OPT_HYSTERESIS:
+			if (parse_ulong(optarg, &o->hysteresis_ms))
+				return -1;
+			break;
+		case OPT_READ_CYCLE:
+			if (parse_ulong(optarg, &o->read_cycle_ms))
+				return -1;
+			break;
+		case OPT_FILLER_SLEEP:
+			if (parse_ulong(optarg, &o->filler_sleep_ms))
+				return -1;
+			break;
+		case OPT_BUDGET:
+			if (parse_size(optarg, &o->budget))
+				return -1;
+			break;
+		case OPT_TMAX:
+			if (parse_size(optarg, &o->tmax))
+				return -1;
+			break;
+		case OPT_FILLER:
+			if (parse_size(optarg, &o->filler_bytes))
+				return -1;
+			break;
+		case OPT_BURST:
+			if (parse_size(optarg, &o->burst_bytes))
+				return -1;
+			break;
+		case OPT_RAMP:
+			if (parse_ulong(optarg, &o->ramp_sec))
+				return -1;
+			break;
+		case OPT_AGENT_MIN:
+			if (parse_size(optarg, &o->agent_min))
+				return -1;
+			break;
 		default:
 			return -1;
 		}
@@ -1086,9 +2387,15 @@ int main(int argc, char **argv)
 		.file_size = DEFAULT_FILE_SIZE,
 		.read_times = DEFAULT_READ_TIMES,
 		.stats_sec = DEFAULT_STATS_SEC,
+		/* Pre-set, not filled in after parsing like the other cmp
+		 * knobs: an explicit 0 is a legal calibration choice here
+		 * (tight reader loop / full-rate filler).
+		 */
+		.read_cycle_ms = DEFAULT_CMP_READ_CYCLE_MS,
+		.filler_sleep_ms = DEFAULT_CMP_FILLER_SLEEP_MS,
 	};
 	const char *mode;
-	bool bench;
+	bool bench, cmp;
 
 	if (argc < 2) {
 		usage(argv[0]);
@@ -1102,8 +2409,9 @@ int main(int argc, char **argv)
 	}
 
 	bench = !strcmp(mode, "bench");
-	if (!bench && strcmp(mode, "watch")) {
-		fprintf(stderr, "ERROR: unknown mode '%s', expected bench or watch\n\n",
+	cmp = !strcmp(mode, "cmp");
+	if (!bench && !cmp && strcmp(mode, "watch")) {
+		fprintf(stderr, "ERROR: unknown mode '%s', expected bench, watch or cmp\n\n",
 			mode);
 		usage(argv[0]);
 		return 1;
@@ -1117,9 +2425,39 @@ int main(int argc, char **argv)
 	}
 
 	if (!o.interval_ms)
-		o.interval_ms = bench ? BENCH_INTERVAL_MS : WATCH_INTERVAL_MS;
+		o.interval_ms = cmp ? DEFAULT_CMP_INTERVAL_MS :
+				bench ? BENCH_INTERVAL_MS : WATCH_INTERVAL_MS;
 	if (!o.stats_sec)
 		o.stats_sec = DEFAULT_STATS_SEC;
+	if (cmp) {
+		/* Zero means "not given" for every cmp knob except --burst,
+		 * where 0 is a legal steady-state choice.
+		 */
+		if (!o.duration_sec)
+			o.duration_sec = DEFAULT_CMP_DURATION_SEC;
+		if (!o.ramp_sec)
+			o.ramp_sec = DEFAULT_CMP_RAMP_SEC;
+		if (!o.hysteresis_ms)
+			o.hysteresis_ms = DEFAULT_CMP_HYSTERESIS_MS;
+		if (!o.psi_us)
+			o.psi_us = DEFAULT_CMP_PSI_US;
+		if (!o.budget)
+			o.budget = DEFAULT_CMP_BUDGET;
+		if (!o.tmax)
+			o.tmax = DEFAULT_CMP_TMAX;
+		if (!o.filler_bytes)
+			o.filler_bytes = DEFAULT_CMP_FILLER;
+		if (!o.agent_min)
+			o.agent_min = DEFAULT_CMP_AGENT_MIN;
+		/* -t defaults to 1 refault byte for the reclaim demo; cmp's
+		 * evidence is A's memory.current fall in pages per second, so
+		 * cmp's own default applies unless the user gave -t
+		 * explicitly. A user passing -t 1 for cmp gets what they
+		 * asked for.
+		 */
+		if (o.threshold == DEFAULT_THRESHOLD)
+			o.threshold = DEFAULT_CMP_RATE;
+	}
 	if (!o.threshold || !o.batch_bytes || !o.max_batches) {
 		fprintf(stderr, "ERROR: --threshold, --batch and --max-batches must be non-zero\n");
 		return 1;
@@ -1138,5 +2476,5 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	return bench ? do_bench(&o) : do_watch(&o);
+	return cmp ? do_cmp(&o) : bench ? do_bench(&o) : do_watch(&o);
 }

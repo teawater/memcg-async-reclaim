@@ -50,14 +50,14 @@ all: $(TARGET)
 vmlinux.h:
 	$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > $@
 
-memcg_async_reclaim.bpf.o: memcg_async_reclaim.bpf.c memcg_async_reclaim.h vmlinux.h
+memcg_async_reclaim.bpf.o: memcg_async_reclaim.bpf.c memcg_async_reclaim.h policy.h vmlinux.h
 	$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) $(LIBBPF_CFLAGS) -c $< -o $@
 
 memcg_async_reclaim.skel.h: memcg_async_reclaim.bpf.o
 	$(BPFTOOL) gen skeleton $< name memcg_async_reclaim > $@
 
 memcg_async_reclaim_user.o: memcg_async_reclaim_user.c memcg_async_reclaim.skel.h \
-			    memcg_async_reclaim.h cgroup_helpers.h compat.h
+			    memcg_async_reclaim.h policy.h cgroup_helpers.h compat.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 cgroup_helpers.o: cgroup_helpers.c cgroup_helpers.h

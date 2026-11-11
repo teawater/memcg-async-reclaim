@@ -36,4 +36,30 @@ struct reclaim_event {
 	__u64 outcome;
 };
 
+/*
+ * Configuration of the cmp three-arm comparison, written by the loader into
+ * the cmp_cfg array map before the struct_ops program is attached and before
+ * cmp_prot_init() runs. Runtime-writable (array maps are not frozen), so the
+ * loader can also disable everything by clearing @enabled.
+ */
+struct cmp_cfg {
+	/* 0 = every cmp hook reports no request. */
+	__u64 enabled;
+	/* Cgroup the evidence is collected for (cgroup A). */
+	__u64 monitor_cgroup_id;
+	/* B1 poll tick; 0 for hook-only arms (B2, sanity). */
+	__u64 interval_ns;
+	/* A memory.current fall, in pages per second, that turns protection
+	 * on (all arms; policy.h rate-normalizes, so sample frequency does
+	 * not matter).
+	 */
+	__u64 drop_rate;
+	/* Hold protection this long after the evidence stops. */
+	__u64 hysteresis_ns;
+	/* The loader's page size: bpf_mem_cgroup_usage() returns bytes while
+	 * ctx->usage and the policy work in pages.
+	 */
+	__u64 page_size;
+};
+
 #endif /* __MEMCG_ASYNC_RECLAIM_H */

@@ -19,4 +19,8 @@
 #define __maybe_unused __attribute__((unused))
 #endif
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+
 #endif /* __COMPAT_H */

@@ -15,6 +15,7 @@
 #include <bpf/bpf_core_read.h>
 
 #include "memcg_async_reclaim.h"
+#include "policy.h"
 
 #define CLOCK_MONOTONIC		1
 
@@ -102,7 +103,8 @@ static void put_cgroup_memcg(struct cgroup_memcg *cm)
 }
 
 /*
- * Total workingset refaults of a cgroup, across memory types.
+ * Total workingset refaults of a cgroup, across memory types: the trigger
+ * evidence of the async reclaim demo.
  *
  * Pressure shows up in the counter matching the memory the workload uses: a
  * page-cache workload refaults file pages, an anonymous one refaults anon.
@@ -123,6 +125,30 @@ static int get_cgroup_refaults(u64 cgroup_id, u64 *val)
 	       bpf_mem_cgroup_page_state(cm.memcg,
 		bpf_core_enum_value(enum node_stat_item,
 				    WORKINGSET_REFAULT_ANON));
+	put_cgroup_memcg(&cm);
+
+	return 0;
+}
+
+/*
+ * A's memory.current in pages: the live page_counter the kernel charges and
+ * uncharges synchronously, and the same counter all three cmp arms sample
+ * (U preads memory.current, B1 reads it through bpf_mem_cgroup_usage(), B2
+ * gets it as ctx->usage inside the hook). No rstat flush is involved - which
+ * is exactly what pgsteal, the first calibration's evidence, could not offer
+ * B2: its flushed global counters only advance in flush-sized steps, and
+ * nothing flushes inside a reclaim pass. The kfunc returns bytes; the policy
+ * and ctx->usage are in pages, so convert with the loader's page size.
+ */
+static int get_cgroup_usage_pages(u64 cgroup_id, u64 page_size, u64 *val)
+{
+	struct cgroup_memcg cm;
+
+	if (!page_size)
+		return -1;
+	if (get_cgroup_memcg_from_id(cgroup_id, &cm))
+		return -1;
+	*val = bpf_mem_cgroup_usage(cm.memcg) / page_size;
 	put_cgroup_memcg(&cm);
 
 	return 0;
@@ -345,5 +371,262 @@ int reclaim_prog_init(struct reclaim_cfg *ctx)
 
 	return bpf_timer_start(&elem->timer, elem->check_ns, 0);
 }
+
+/*
+ * cmp: three arms of the memory.low request comparison.
+ *
+ * All three arms watch A's memory.current and ask for protection when it
+ * falls fast enough; they differ only in where the decision runs and how
+ * the counter is sampled:
+ *
+ *   B1 (cmp_prot_ops_poll)  a bpf_timer ticks every cfg->interval_ns and a
+ *                           bpf_wq callback samples the counter through
+ *                           bpf_mem_cgroup_usage() and stores a boolean;
+ *                           the hook only executes that verdict.
+ *   B2 (cmp_prot_ops_hook)  the decision runs inside low_request itself, at
+ *                           the collection point, on every protection pass,
+ *                           on ctx->usage - the same page_counter, read live
+ *                           by the kernel for this very pass. No kfunc, no
+ *                           acquire route, no flush dependency.
+ *   sanity (cmp_prot_ops_sanity)  requests unconditionally; used to verify
+ *                           the protection chain end to end before a round.
+ *
+ * The userspace arm (U) lives entirely in the loader, preads the same
+ * counter through memory.current, and shares policy.h. The hooks are
+ * attached to A's cgroup only, so the effective-array walk already scopes
+ * them to A; no cgroup id filter is needed.
+ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct cmp_cfg);
+} cmp_cfg SEC(".maps");
+
+/*
+ * Run statistics, written by BPF only (userspace reads them after load; .bss
+ * is frozen for userspace writes). cmp_first_request_ns is the ktime of the
+ * first pass whose request was granted-worthy, which is the B-side analogue
+ * of the agent's first memory.low write.
+ */
+__u64 cmp_hook_calls;
+__u64 cmp_requests;
+__u64 cmp_acquire_fails;
+__u64 cmp_poll_ticks;
+__u64 cmp_timer_failures;
+__u64 cmp_first_request_ns;
+
+/* B1: verdict decided by the wq callback, read by the hook. Plain u64
+ * load/store; a torn read is impossible and a stale one lasts at most the
+ * gap between a tick and a pass.
+ */
+static struct policy_state cmp_b1_state;
+__u64 cmp_protect_now;
+
+/* B2: decision state, updated inside the hook. */
+static struct policy_state cmp_b2_state;
+
+static struct cmp_cfg *cmp_cfg_lookup(void)
+{
+	__u32 key = 0;
+
+	return bpf_map_lookup_elem(&cmp_cfg, &key);
+}
+
+static void cmp_note_request(void)
+{
+	__u64 now = bpf_ktime_get_ns();
+
+	cmp_requests++;
+	if (!cmp_first_request_ns)
+		cmp_first_request_ns = now;
+}
+
+/* B1: one decision per tick; the reclaim batches of the async demo are not
+ * part of this arm - the verdict is the only output.
+ */
+struct cmp_wq_elem {
+	struct bpf_timer timer;
+	struct bpf_wq work;
+	u64 interval_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct cmp_wq_elem);
+} cmp_wq_map SEC(".maps");
+
+static int cmp_work_fn(void *map, int *key, void *value)
+{
+	struct cmp_cfg *cfg = cmp_cfg_lookup();
+	u64 usage;
+
+	if (!cfg || !cfg->enabled)
+		return 0;
+
+	if (get_cgroup_usage_pages(cfg->monitor_cgroup_id, cfg->page_size,
+				   &usage)) {
+		cmp_acquire_fails++;
+		return 0;
+	}
+
+	cmp_protect_now = policy_protect(&cmp_b1_state, usage,
+					 bpf_ktime_get_ns(),
+					 cfg->drop_rate,
+					 cfg->hysteresis_ns);
+	cmp_poll_ticks++;
+
+	return 0;
+}
+
+static int cmp_timer_cb(void *map, int *key, struct cmp_wq_elem *elem)
+{
+	bpf_wq_start(&elem->work, 0);
+	if (bpf_timer_start(&elem->timer, elem->interval_ns, 0))
+		cmp_timer_failures++;
+
+	return 0;
+}
+
+/*
+ * Seeds both B-arm baselines - one whose prev_ns is 0 would dilute the
+ * first sample's fall over the whole uptime - and starts the B1 timer.
+ * Both states seed from the same live counter: ctx->usage and
+ * bpf_mem_cgroup_usage() are the same page_counter. A failed seed leaves
+ * prev_level at 0, which the fall-based policy turns into "first sample
+ * carries no evidence", never a spurious trigger. Hook-only arms pass
+ * interval_ns = 0 and stop here.
+ */
+SEC("syscall")
+int cmp_prot_init(void)
+{
+	struct cmp_wq_elem *elem;
+	struct cmp_cfg *cfg;
+	__u32 key = 0;
+	u64 val, now;
+	int ret;
+
+	cfg = cmp_cfg_lookup();
+	if (!cfg || !cfg->enabled)
+		return -1;
+
+	now = bpf_ktime_get_ns();
+
+	if (!get_cgroup_usage_pages(cfg->monitor_cgroup_id, cfg->page_size,
+				    &val)) {
+		cmp_b1_state.prev_level = val;
+		cmp_b2_state.prev_level = val;
+	}
+	cmp_b1_state.prev_ns = now;
+	cmp_b1_state.on_since = 0;
+	cmp_b2_state.prev_ns = now;
+	cmp_b2_state.on_since = 0;
+
+	if (!cfg->interval_ns)
+		return 0;
+
+	elem = bpf_map_lookup_elem(&cmp_wq_map, &key);
+	if (!elem)
+		return -1;
+
+	ret = bpf_wq_init(&elem->work, &cmp_wq_map, 0);
+	if (ret)
+		return ret;
+
+	ret = bpf_wq_set_callback(&elem->work, cmp_work_fn, 0);
+	if (ret)
+		return ret;
+
+	ret = bpf_timer_init(&elem->timer, &cmp_wq_map, CLOCK_MONOTONIC);
+	if (ret)
+		return ret;
+
+	ret = bpf_timer_set_callback(&elem->timer, cmp_timer_cb);
+	if (ret)
+		return ret;
+
+	elem->interval_ns = cfg->interval_ns;
+
+	return bpf_timer_start(&elem->timer, elem->interval_ns, 0);
+}
+
+/*
+ * Hand-expanded BPF_PROG(): ctx[0] is the member's single argument. The
+ * macro is avoided because not every installed bpf_helpers.h has it.
+ */
+SEC("struct_ops")
+__u32 cmp_low_request_poll(unsigned long long *ctx)
+{
+	struct cmp_cfg *cfg = cmp_cfg_lookup();
+
+	if (!cfg || !cfg->enabled)
+		return BPF_MEMCG_PROT_NO_REQUEST;
+
+	cmp_hook_calls++;
+
+	if (!cmp_protect_now)
+		return BPF_MEMCG_PROT_NO_REQUEST;
+
+	cmp_note_request();
+
+	return BPF_MEMCG_PROT_REQUEST_USAGE;
+}
+
+SEC("struct_ops")
+__u32 cmp_low_request_hook(unsigned long long *ctx)
+{
+	const struct bpf_memcg_prot_ctx *pctx = (const void *)ctx[0];
+	struct cmp_cfg *cfg = cmp_cfg_lookup();
+
+	if (!cfg || !cfg->enabled)
+		return BPF_MEMCG_PROT_NO_REQUEST;
+
+	cmp_hook_calls++;
+
+	/*
+	 * ctx->usage is A's page_counter, read live by the kernel for this
+	 * very pass: no kfunc, no acquire route, no rstat flush to wait for.
+	 * The fall since the previous pass is the evidence.
+	 */
+	if (!policy_protect(&cmp_b2_state, pctx->usage, bpf_ktime_get_ns(),
+			    cfg->drop_rate, cfg->hysteresis_ns))
+		return BPF_MEMCG_PROT_NO_REQUEST;
+
+	cmp_note_request();
+
+	return BPF_MEMCG_PROT_REQUEST_USAGE;
+}
+
+SEC("struct_ops")
+__u32 cmp_low_request_sanity(unsigned long long *ctx)
+{
+	struct cmp_cfg *cfg = cmp_cfg_lookup();
+
+	if (!cfg || !cfg->enabled)
+		return BPF_MEMCG_PROT_NO_REQUEST;
+
+	cmp_hook_calls++;
+	cmp_note_request();
+
+	return BPF_MEMCG_PROT_REQUEST_USAGE;
+}
+
+SEC(".struct_ops.link")
+struct bpf_memcg_ops cmp_prot_ops_poll = {
+	.low_request	= (void *)cmp_low_request_poll,
+};
+
+SEC(".struct_ops.link")
+struct bpf_memcg_ops cmp_prot_ops_hook = {
+	.low_request	= (void *)cmp_low_request_hook,
+};
+
+SEC(".struct_ops.link")
+struct bpf_memcg_ops cmp_prot_ops_sanity = {
+	.low_request	= (void *)cmp_low_request_sanity,
+};
 
 char _license[] SEC("license") = "GPL";
