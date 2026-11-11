@@ -1,0 +1,11 @@
+cmp: impl=user trigger=poll interval=5ms rate=12800/s hysteresis=50ms read-cycle=500ms filler-sleep=500ms
+     tmax=160.0 MiB budget=64.0 MiB filler=112.0 MiB burst=64.0 MiB a-file=32.0 MiB agent-min=8.0 MiB
+     ramp=5s duration=30s
+
+--- result (window = 30.0s burst phase) ---
+A: pgsteal +9869 pages, refault +9 KiB, low overrides +0, PSI some +17962 us, current 33712 KiB
+A: reads 70, avg 4069 us, max 12596 us
+B: PSI some +1164171 us, current 64176 KiB
+first protection: never - ROUND VOID (trigger not reached)
+agent: decisions 0, low writes 0, sample avg 0 us max 0 us
+agent cpu: 0 us (agent cgroup), A cpu 237437 us, B cpu 4738267 us, C cpu 66121 us

@@ -1,0 +1,12 @@
+cmp: impl=bpf-poll trigger=timer interval=5ms rate=12800/s hysteresis=50ms read-cycle=500ms filler-sleep=500ms
+     tmax=160.0 MiB budget=64.0 MiB filler=112.0 MiB burst=64.0 MiB a-file=32.0 MiB agent-min=8.0 MiB
+     ramp=5s duration=30s
+
+--- result (window = 31.8s burst phase) ---
+A: pgsteal +2615 pages, refault +2 KiB, low overrides +0, PSI some +5615 us, current 34268 KiB
+A: reads 70, avg 3732 us, max 6138 us
+B: PSI some +1014919 us, current 63468 KiB
+first protection: +1794.7 ms from burst start
+bpf: hook calls 50880, requests 5772, poll ticks 7163, acquire fails 0, timer fails 0
+bpf: hook run_time 1413794 ns over 50880 runs (avg 27 ns)
+cpu: A 222356 us, B 4166279 us, C 65946 us

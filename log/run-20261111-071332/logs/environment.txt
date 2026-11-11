@@ -1,0 +1,4 @@
+kernel: 7.3.0-g4098ae968b34
+swap:
+Filename				Type		Size		Used		Priority
+meminfo: MemTotal:        8095336 kB MemFree:         7088448 kB SwapTotal:             0 kB 

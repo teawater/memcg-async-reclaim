@@ -1,0 +1,8 @@
+WARNING: round 17 arm ucurve-timer-100ms-rep2 VOID (trigger not reached) (expected curve endpoint, not a protocol failure)
+WARNING: round 18 arm ucurve-timer-100ms-rep3 VOID (trigger not reached) (expected curve endpoint, not a protocol failure)
+WARNING: round 19 arm ucurve-timer-100ms-rep4 VOID (trigger not reached) (expected curve endpoint, not a protocol failure)
+WARNING: round 21 arm ucurve-poll-10000us-rep1 VOID (trigger not reached) (expected curve endpoint, not a protocol failure)
+WARNING: round 22 arm ucurve-poll-10000us-rep2 VOID (trigger not reached) (expected curve endpoint, not a protocol failure)
+WARNING: round 23 arm ucurve-poll-10000us-rep3 VOID (trigger not reached) (expected curve endpoint, not a protocol failure)
+WARNING: round 24 arm ucurve-poll-10000us-rep4 VOID (trigger not reached) (expected curve endpoint, not a protocol failure)
+WARNING: round 25 arm ucurve-poll-10000us-rep5 VOID (trigger not reached) (expected curve endpoint, not a protocol failure)

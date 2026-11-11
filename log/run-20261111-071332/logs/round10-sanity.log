@@ -1,0 +1,13 @@
+cmp: impl=sanity trigger=timer interval=5ms rate=12800/s hysteresis=50ms read-cycle=500ms filler-sleep=500ms
+     tmax=160.0 MiB budget=64.0 MiB filler=112.0 MiB burst=64.0 MiB a-file=32.0 MiB agent-min=8.0 MiB
+     ramp=3s duration=10s
+
+--- result (window = 10.0s burst phase) ---
+A: pgsteal +0 pages, refault +0 KiB, low overrides +0, PSI some +16 us, current 34372 KiB
+A: reads 26, avg 3397 us, max 5135 us
+B: PSI some +301674 us, current 63524 KiB
+first protection: +13.6 ms from burst start
+bpf: hook calls 16969, requests 16969, poll ticks 0, acquire fails 0, timer fails 0
+bpf: hook run_time 793851 ns over 16969 runs (avg 46 ns)
+cpu: A 65615 us, B 1324335 us, C 68110 us
+sanity: PASS (hook calls 16969 in window, A pgsteal +0 pages, tol 1024, refault +0 KiB, low overrides +0)

@@ -1,0 +1,11 @@
+cmp: impl=user trigger=timer interval=5ms rate=12800/s hysteresis=50ms read-cycle=500ms filler-sleep=500ms
+     tmax=160.0 MiB budget=64.0 MiB filler=112.0 MiB burst=64.0 MiB a-file=32.0 MiB agent-min=8.0 MiB
+     ramp=5s duration=30s
+
+--- result (window = 30.6s burst phase) ---
+A: pgsteal +4895 pages, refault +4 KiB, low overrides +0, PSI some +16998 us, current 34212 KiB
+A: reads 70, avg 3886 us, max 12954 us
+B: PSI some +1273555 us, current 63400 KiB
+first protection: +1215.9 ms from burst start
+agent: decisions 6692, low writes 198, sample avg 9 us max 70 us
+agent cpu: 137506 us (agent cgroup), A cpu 219459 us, B cpu 4847770 us, C cpu 67232 us
